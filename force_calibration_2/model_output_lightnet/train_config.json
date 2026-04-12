@@ -3,8 +3,8 @@
   "output_dim": 6,
   "lr": 0.001,
   "batch_size": 64,
-  "epochs_trained": 139,
-  "best_val_loss": 0.03207811613668664,
+  "epochs_trained": 156,
+  "best_val_loss": 0.0331410657053288,
   "noise_std": 0.01,
   "concentration_weight": 1.0,
   "train_val_files": [
@@ -35,5 +35,5 @@
   "test_files": [
     "processed_calibration_20260328_161912.h5"
   ],
-  "timestamp": "20260401_173221"
+  "timestamp": "20260412_170644"
 }
