@@ -1,0 +1,10 @@
+{
+    "blur": 15,
+    "block_size": 51,
+    "c_val": 20,
+    "morph_size": 2,
+    "min_area": 92,
+    "max_area": 1000,
+    "circularity": 70,
+    "inertia": 30
+}

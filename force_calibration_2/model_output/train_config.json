@@ -1,0 +1,54 @@
+{
+  "input_dim": 189,
+  "output_dim": 6,
+  "hidden_dims": [
+    512,
+    256,
+    128
+  ],
+  "dropout": [
+    0.2,
+    0.1,
+    0.0
+  ],
+  "lr": 0.0005,
+  "batch_size": 64,
+  "epochs_trained": 116,
+  "best_val_loss": 0.018115713655088957,
+  "device": "cpu",
+  "noise_std": 0.01,
+  "scheduler": "plateau",
+  "train_val_files": [
+    "processed_calibration_20260328_154637.h5",
+    "processed_calibration_20260328_154818.h5",
+    "processed_calibration_20260328_154949.h5",
+    "processed_calibration_20260328_155109.h5",
+    "processed_calibration_20260328_155246.h5",
+    "processed_calibration_20260328_155423.h5",
+    "processed_calibration_20260328_155554.h5",
+    "processed_calibration_20260328_155721.h5",
+    "processed_calibration_20260328_155903.h5",
+    "processed_calibration_20260328_160032.h5",
+    "processed_calibration_20260328_160158.h5",
+    "processed_calibration_20260328_160327.h5",
+    "processed_calibration_20260328_160448.h5",
+    "processed_calibration_20260328_160551.h5",
+    "processed_calibration_20260328_160713.h5",
+    "processed_calibration_20260328_160836.h5",
+    "processed_calibration_20260328_160947.h5",
+    "processed_calibration_20260328_161106.h5",
+    "processed_calibration_20260328_161218.h5",
+    "processed_calibration_20260328_161330.h5",
+    "processed_calibration_20260328_161445.h5",
+    "processed_calibration_20260328_161556.h5",
+    "processed_calibration_20260328_161807.h5"
+  ],
+  "test_files": [
+    "processed_calibration_20260328_161912.h5"
+  ],
+  "total_samples": 17548,
+  "train_samples": 14080,
+  "val_samples": 2496,
+  "test_samples": 972,
+  "timestamp": "20260401_163807"
+}
