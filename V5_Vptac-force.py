@@ -1,27 +1,35 @@
 # -*- coding: utf-8 -*-
 '''
-视频/摄像头标记点跟踪与三维重建播放器 + 压电触觉传感器数据采集
+视频/摄像头标记点跟踪与三维重建播放器
 功能说明：
 1. 支持读取视频文件或USB摄像头实时采集
 2. 逐帧进行标记点检测和三维重建
 3. 启动前弹出文件选择窗口：标定文件夹、参数JSON文件、首帧ROI和匹配数据保存文件夹
-4. GUI中同时显示视频帧、三维点云和触觉传感器信号
+4. GUI中同时显示视频帧和三维点云
 5. 支持暂停/播放，支持手动调整三维点云观察角度
-6. 视觉和触觉信号时间同步
+6. 支持"设置为首帧"动态更新基准帧
+7. 六维力传感器实时订阅与显示
+8. HDF5数据采集：同步记录视觉3D坐标(xyz/dxyz)和六维力传感器数据(fx,fy,fz,mx,my,mz)
 '''
 import sys
+import signal
 import os
+_utils_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils")
+os.add_dll_directory(_utils_dir)
+sys.path.insert(0, _utils_dir)
 import json
 import time
 import threading
+from datetime import datetime
 import numpy as np
+import h5py
 import cv2
-import serial
-import serial.tools.list_ports
+import topic # type: ignore
+import message # type: ignore
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
                              QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox,
                              QGroupBox, QStatusBar, QSlider, QSpinBox, QSplitter,
-                             QComboBox, QCheckBox, QTabWidget)
+                             QCheckBox)
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -31,64 +39,12 @@ from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import cKDTree, Delaunay
 from scipy.interpolate import Rbf
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import cdist
-import pyqtgraph as pg
-
-
-class SerialReceiver(QThread):
-    """串口数据接收线程"""
-    data_received = pyqtSignal(bytes, float)  # 数据和时间戳
-
-    def __init__(self, port='COM32', baudrate=921600):
-        super().__init__()
-        self.port = port
-        self.baudrate = baudrate
-        self.serial = None
-        self.running = False
-        self.buffer = b''
-        self.start_time = None 
-
-    def run(self):
-        try:
-            self.serial = serial.Serial(self.port, self.baudrate, timeout=1)
-            self.running = True
-            self.start_time = time.time()
-            while self.running:
-                if self.serial.in_waiting > 0:
-                    self.buffer += self.serial.read(self.serial.in_waiting)
-                    self.process_data()
-        except serial.SerialException as e:
-            print(f"串口错误: {e}")
-
-    def stop(self):
-        self.running = False
-        if self.serial and self.serial.is_open:
-            self.serial.close()
-        self.quit()
-        self.wait()
-
-    def process_data(self):
-        FRAME_LENGTH = 29
-        while True:
-            aaaa_index = self.buffer.find(b'\xaa\xaa')
-            if aaaa_index == -1 or len(self.buffer) < aaaa_index + FRAME_LENGTH:
-                break
-
-            if aaaa_index + FRAME_LENGTH <= len(self.buffer):
-                if self.buffer[aaaa_index + FRAME_LENGTH - 2: aaaa_index + FRAME_LENGTH] == b'\xff\xff':
-                    group_data = self.buffer[aaaa_index + 2: aaaa_index + FRAME_LENGTH - 2]
-                    timestamp = time.time() - self.start_time if self.start_time else 0
-                    self.data_received.emit(group_data, timestamp)
-                    self.buffer = self.buffer[aaaa_index + FRAME_LENGTH:]
-                else:
-                    break
-            else:
-                break
+from scipy.spatial.distance import cdist, pdist
 
 
 class CameraThread(QThread):
     """摄像头采集线程"""
-    frame_signal = pyqtSignal(np.ndarray)
+    frame_signal = pyqtSignal(np.ndarray, float)
 
     def __init__(self, camera_index=0, fps=30, rotate_180=True):
         super().__init__()
@@ -110,9 +66,10 @@ class CameraThread(QThread):
             start_time = time.time()
             ret, frame = self.video_cap.read()
             if ret:
+                capture_timestamp = time.time()
                 if self.rotate_180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
-                self.frame_signal.emit(frame)
+                self.frame_signal.emit(frame, capture_timestamp)
 
             elapsed = time.time() - start_time
             wait_time = frame_interval - elapsed
@@ -124,12 +81,15 @@ class CameraThread(QThread):
 
     def stop(self):
         self.running = False
-        self.wait()
+        # 给线程一个超时时间，避免 cv2.read() 阻塞导致无限等待
+        if not self.wait(3000):
+            self.terminate()
+            self.wait(1000)
 
 
 class FrameProcessThread(QThread):
     """帧处理线程 - 将耗时的检测和重建放到后台"""
-    result_signal = pyqtSignal(object, object, object, object, object, object)  # frame, points_3d, left_pts, right_pts, left_lost, right_lost
+    result_signal = pyqtSignal(object, object, object, object, object, object, object, object)  # frame, points_3d, left_pts, right_pts, left_lost, right_lost, timestamp, is_abnormal
 
     def __init__(self):
         super().__init__()
@@ -142,10 +102,10 @@ class FrameProcessThread(QThread):
     def set_processor(self, process_func):
         self.process_func = process_func
 
-    def add_frame(self, frame):
+    def add_frame(self, frame, timestamp=0.0):
         with self.lock:
             # 只保留最新帧，丢弃旧帧
-            self.frame_queue = [frame]
+            self.frame_queue = [(frame, timestamp)]
         self.has_new_frame.set()
 
     def run(self):
@@ -155,51 +115,49 @@ class FrameProcessThread(QThread):
                 break
 
             frame = None
+            timestamp = 0.0
             with self.lock:
                 if self.frame_queue:
-                    frame = self.frame_queue.pop(0)
+                    frame, timestamp = self.frame_queue.pop(0)
             self.has_new_frame.clear()
 
             if frame is not None and self.process_func is not None:
                 try:
-                    points_3d, left_pts, right_pts, left_lost, right_lost = self.process_func(frame)
-                    self.result_signal.emit(frame, points_3d, left_pts, right_pts, left_lost, right_lost)
+                    points_3d, left_pts, right_pts, left_lost, right_lost, is_abnormal = self.process_func(frame)
+                    self.result_signal.emit(frame, points_3d, left_pts, right_pts, left_lost, right_lost, timestamp, is_abnormal)
                 except Exception as e:
                     pass
 
     def stop(self):
         self.running = False
         self.has_new_frame.set()
-        self.wait()
+        if not self.wait(3000):
+            self.terminate()
+            self.wait(1000)
 
 
 class CircleDetector:
     def __init__(self, config_path="marker_params.json", verbose=True):
-        # 默认参数
         self.params = {
             "blur": 3, "block_size": 11, "c_val": 5, "morph_size": 2,
             "min_area": 30, "max_area": 1000, "circularity": 70, "inertia": 30
         }
-        # 加载参数
-        import os, json
         if os.path.exists(config_path):
             try:
                 with open(config_path, 'r') as f:
                     saved_params = json.load(f)
                     self.params.update(saved_params)
                 if verbose:
-                    print(f"✓ 已加载参数配置: {config_path}")
+                    print(f"已加载参数配置: {config_path}")
             except Exception as e:
                 if verbose:
                     print(f"⚠ 加载参数文件失败，使用默认值: {e}")
         else:
             if verbose:
-                print("⚠ 未找到 marker_params.json，使用系统默认参数")
+                print("⚠ 未找到参数文件，使用系统默认参数")
 
     def _detect_by_local_minima(self, gray, blur):
-        import cv2
-        import numpy as np
-        
+        """局部极小值检测方法"""
         min_area = self.params["min_area"]
         avg_radius = max(3, int(np.sqrt(min_area / np.pi)))
         win = avg_radius * 2 + 1
@@ -234,9 +192,6 @@ class CircleDetector:
         if len(points) <= 1:
             return points
 
-        import numpy as np
-        from scipy.spatial import cKDTree
-        
         points_arr = np.array([(x, y) for x, y, _ in points], dtype=np.float32)
         tree = cKDTree(points_arr)
 
@@ -253,9 +208,6 @@ class CircleDetector:
         return result
 
     def detect(self, image):
-        import cv2
-        import numpy as np
-        
         # 1. 预处理
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -285,14 +237,14 @@ class CircleDetector:
 
 
 class VideoPointCloudPlayer(QMainWindow):
-    """视频/摄像头点云播放器主窗口 + 触觉传感器"""
+    """视频/摄像头点云播放器主窗口"""
 
     # 配置文件路径（保存上次选择的输入源配置）
     CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_input_config.json")
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("视觉触觉融合系统 - 标记点跟踪与触觉信号采集")
+        self.setWindowTitle("视觉系统 - 标记点跟踪与三维重建")
         self.setGeometry(50, 50, 1600, 950)
 
         # 输入模式: 'video' 或 'camera'
@@ -350,6 +302,7 @@ class VideoPointCloudPlayer(QMainWindow):
 
         # 匹配参数
         self.max_match_dist = 50
+        self.consecutive_abnormal_frames = 0
 
         # 3D视角
         self.view_elev = 90
@@ -366,33 +319,37 @@ class VideoPointCloudPlayer(QMainWindow):
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self.on_timer_tick)
 
-        # 触觉传感器相关
-        self.serial_receiver = None
-        self.tactile_start_time = None  # 触觉数据采集开始时间
-        self.visual_start_time = None   # 视觉数据采集开始时间
-        self.data_ptac_adc1 = []
-        self.data_ptac_adc2 = []
-        self.data_ptac_adc3 = []
-        self.data_ptac_adc4 = []
-        self.data_ptac_adc5 = []
-        self.tactile_timestamps = []  # 触觉数据时间戳
-        self.visual_timestamps = []   # 视觉数据时间戳
-
-        # 触觉信号更新定时器
-        self.tactile_timer = QTimer(self)
-        self.tactile_timer.timeout.connect(self.update_tactile_plot)
-        self.tactile_timer.start(50)
-
         # 位移统计数据
         self.avg_displacement_vector = np.array([0.0, 0.0, 0.0])  # 平均位移向量
         self.avg_displacement_magnitude = 0.0  # 平均位移大小
         self.max_displacement = 0.0  # 最大位移
         self.min_displacement = 0.0  # 最小位移
         self.current_points_3d = None  # 当前帧3D点
-        self.consecutive_abnormal_frames = 0  # 连续异常帧计数器
+
+        # HDF5 数据采集
+        self.is_recording = False
+        self.recording_buffer = {
+            'timestamps': [],
+            'xyz': [],
+            'abnormal': [],  # 异常帧标记: True=异常帧(点追踪故障重置)
+        }
+
+        # 六维力传感器相关
+        self.ft_node = None
+        self.ft_subscription = None
+        self.ft_lock = threading.Lock()
+        self.latest_ft_data = None  # 最新的力传感器数据 (list of FtvalueInfo)
+        self.latest_ft_timestamp = 0.0  # 最新力传感器数据的时间戳
+        self.ft_recording_buffer = {
+            'timestamps': [],
+            'ft_values': [],  # 每个元素为 [fx, fy, fz, mx, my, mz]
+        }
 
         # 初始化界面
         self.init_ui()
+
+        # 启动六维力传感器订阅
+        self.start_ft_subscription()
 
         # 启动时尝试自动加载上次的输入源配置
         QTimer.singleShot(100, self.auto_load_last_config)
@@ -421,6 +378,10 @@ class VideoPointCloudPlayer(QMainWindow):
         self.btn_set_as_base = QPushButton("设置为首帧")
         self.btn_set_as_base.clicked.connect(self.set_current_as_base)
         self.btn_set_as_base.setEnabled(False)
+
+        self.btn_record = QPushButton("开始采集")
+        self.btn_record.clicked.connect(self.toggle_recording)
+        self.btn_record.setEnabled(False)
 
         self.lbl_frame_info = QLabel("帧: 0 / 0")
 
@@ -452,6 +413,7 @@ class VideoPointCloudPlayer(QMainWindow):
         control_layout.addWidget(self.btn_play_pause)
         control_layout.addWidget(self.btn_reset)
         control_layout.addWidget(self.btn_set_as_base)
+        control_layout.addWidget(self.btn_record)
         control_layout.addWidget(self.lbl_frame_info)
         control_layout.addWidget(self.spin_speed)
         control_layout.addWidget(self.spin_max_dist)
@@ -459,49 +421,6 @@ class VideoPointCloudPlayer(QMainWindow):
         control_layout.addWidget(self.spin_camera_idx)
         control_layout.addWidget(self.chk_rotate)
         control_layout.addStretch()
-
-        # 串口控制区域
-        self.lbl_serial = QLabel("串口:")
-        self.cbb_serial_port = QComboBox()
-        self.cbb_serial_port.addItems(self.get_serial_ports())
-        self.cbb_serial_baud = QComboBox()
-        self.cbb_serial_baud.addItems(["921600", "115200"])
-        self.cbb_adc_group = QComboBox()
-        self.cbb_adc_group.addItems(["ADC1", "ADC2", "ADC3", "ADC4", "ADC5"])
-        self.btn_serial_connect = QPushButton("连接串口")
-        self.btn_serial_connect.clicked.connect(self.start_serial_reading)
-        self.btn_serial_disconnect = QPushButton("断开串口")
-        self.btn_serial_disconnect.clicked.connect(self.stop_serial_reading)
-        self.btn_refresh_ports = QPushButton("刷新")
-        self.btn_refresh_ports.clicked.connect(self.refresh_serial_ports)
-
-        control_layout.addWidget(self.lbl_serial)
-        control_layout.addWidget(self.cbb_serial_port)
-        control_layout.addWidget(self.cbb_serial_baud)
-        control_layout.addWidget(self.cbb_adc_group)
-        control_layout.addWidget(self.btn_serial_connect)
-        control_layout.addWidget(self.btn_serial_disconnect)
-        control_layout.addWidget(self.btn_refresh_ports)
-
-        # 通道选择控件（3个通道）
-        self.lbl_channels = QLabel("显示通道:")
-        self.spin_ch1 = QSpinBox()
-        self.spin_ch1.setRange(1, 8)
-        self.spin_ch1.setValue(1)
-        self.spin_ch1.setPrefix("CH")
-        self.spin_ch2 = QSpinBox()
-        self.spin_ch2.setRange(1, 8)
-        self.spin_ch2.setValue(2)
-        self.spin_ch2.setPrefix("CH")
-        self.spin_ch3 = QSpinBox()
-        self.spin_ch3.setRange(1, 8)
-        self.spin_ch3.setValue(3)
-        self.spin_ch3.setPrefix("CH")
-
-        control_layout.addWidget(self.lbl_channels)
-        control_layout.addWidget(self.spin_ch1)
-        control_layout.addWidget(self.spin_ch2)
-        control_layout.addWidget(self.spin_ch3)
 
         control_group.setLayout(control_layout)
         main_layout.addWidget(control_group)
@@ -551,35 +470,24 @@ class VideoPointCloudPlayer(QMainWindow):
         visual_splitter.setSizes([700, 500])
         main_splitter.addWidget(visual_splitter)
 
-        # 下部：触觉信号显示区域
-        tactile_widget = QWidget()
-        tactile_layout = QVBoxLayout(tactile_widget)
-        tactile_layout.setContentsMargins(5, 5, 5, 5)
+        # 下部：六维力传感器实时显示区域
+        ft_group = QGroupBox("六维力传感器实时数据")
+        ft_layout = QHBoxLayout()
+        self.lbl_ft_fx = QLabel("Fx: --")
+        self.lbl_ft_fy = QLabel("Fy: --")
+        self.lbl_ft_fz = QLabel("Fz: --")
+        self.lbl_ft_mx = QLabel("Mx: --")
+        self.lbl_ft_my = QLabel("My: --")
+        self.lbl_ft_mz = QLabel("Mz: --")
+        for lbl in [self.lbl_ft_fx, self.lbl_ft_fy, self.lbl_ft_fz,
+                     self.lbl_ft_mx, self.lbl_ft_my, self.lbl_ft_mz]:
+            lbl.setStyleSheet("font-size: 14px; font-weight: bold; padding: 4px;")
+            ft_layout.addWidget(lbl)
+        ft_layout.addStretch()
+        ft_group.setLayout(ft_layout)
+        main_splitter.addWidget(ft_group)
 
-        # 使用pyqtgraph绘制触觉信号（3个通道，横向排列）
-        self.tactile_plot_widget = pg.GraphicsLayoutWidget()
-        self.tactile_plot_widget.setBackground('w')
-        self.tactile_plot_widget.setMinimumHeight(200)
-
-        self.tactile_plots = []
-        self.tactile_curves = []
-        for i in range(3):
-            plot_item = self.tactile_plot_widget.addPlot(row=0, col=i, title=f"CH:{i + 1}")
-            plot_item.setYRange(-3, 3)  # 纵坐标范围 -3 到 3
-            plot_item.setTitle(f"CH:{i + 1}", color='k', size='10pt')
-            plot_item.getAxis('left').setPen(pg.mkPen(color='k'))
-            plot_item.getAxis('bottom').setPen(pg.mkPen(color='k'))
-            plot_item.getAxis('left').setTextPen(pg.mkPen(color='k'))
-            plot_item.getAxis('bottom').setTextPen(pg.mkPen(color='k'))
-            self.tactile_plots.append(plot_item)
-            curve = plot_item.plot(pen='b')
-            self.tactile_curves.append(curve)
-
-        tactile_layout.addWidget(self.tactile_plot_widget)
-        main_splitter.addWidget(tactile_widget)
-
-        # 设置上下分割比例
-        main_splitter.setSizes([550, 250])
+        # 设置分割比例
         main_layout.addWidget(main_splitter)
 
         # 状态栏
@@ -591,6 +499,64 @@ class VideoPointCloudPlayer(QMainWindow):
         self.canvas_3d.mpl_connect('button_press_event', self.on_3d_mouse_press)
         self.canvas_3d.mpl_connect('button_release_event', self.on_3d_mouse_release)
         self.canvas_3d.mpl_connect('motion_notify_event', self.on_3d_mouse_motion)
+
+        # 力传感器数据刷新定时器
+        self.ft_display_timer = QTimer(self)
+        self.ft_display_timer.timeout.connect(self.update_ft_display)
+        self.ft_display_timer.start(100)  # 每100ms刷新一次
+
+    # ---- 六维力传感器 ----
+    def start_ft_subscription(self):
+        """启动六维力传感器数据订阅"""
+        try:
+            ft_options = topic.NodeOptions()
+            ft_options.node_name = 'v5_ft_subscriber'
+            ft_options.sub_url = 'tcp://192.168.50.1:19091'
+
+            self.ft_node = topic.Node(ft_options)
+            if not self.ft_node.Start():
+                print("六维力传感器节点启动失败")
+                self.ft_node = None
+                return
+
+            self.ft_subscription = self.ft_node.CreateSubscriptionRT(
+                "system_rtstate", self._on_ft_data)
+            print("六维力传感器订阅已启动")
+        except Exception as e:
+            print(f"六维力传感器订阅启动失败: {e}")
+            self.ft_node = None
+
+    def _on_ft_data(self, tt: topic.SystemRtState):
+        """力传感器数据回调（在订阅线程中执行）"""
+        parm = message.SystemStateData()
+        message.display_rt(tt, parm)
+
+        timestamp = time.time()
+
+        with self.ft_lock:
+            self.latest_ft_data = parm.controller.ftvalues
+            self.latest_ft_timestamp = timestamp
+
+            # 如果正在采集，将数据写入缓冲区
+            if self.is_recording and parm.controller.ftvalues:
+                for ftv in parm.controller.ftvalues:
+                    self.ft_recording_buffer['timestamps'].append(timestamp)
+                    self.ft_recording_buffer['ft_values'].append(
+                        [ftv.fx, ftv.fy, ftv.fz, ftv.mx, ftv.my, ftv.mz])
+
+    def update_ft_display(self):
+        """定时刷新力传感器数据显示（在GUI线程中执行）"""
+        with self.ft_lock:
+            ft_data = self.latest_ft_data
+
+        if ft_data and len(ft_data) > 0:
+            ftv = ft_data[0]  # 显示第一个传感器
+            self.lbl_ft_fx.setText(f"Fx: {ftv.fx:+.3f}")
+            self.lbl_ft_fy.setText(f"Fy: {ftv.fy:+.3f}")
+            self.lbl_ft_fz.setText(f"Fz: {ftv.fz:+.3f}")
+            self.lbl_ft_mx.setText(f"Mx: {ftv.mx:+.3f}")
+            self.lbl_ft_my.setText(f"My: {ftv.my:+.3f}")
+            self.lbl_ft_mz.setText(f"Mz: {ftv.mz:+.3f}")
 
     def save_input_config(self):
         """保存当前输入源配置到文件"""
@@ -706,7 +672,7 @@ class VideoPointCloudPlayer(QMainWindow):
         elif clicked == btn_camera:
             self.input_mode = 'camera'
             self.select_files_for_camera()
-        # 取消时不再自动关闭程序，允许用户单独测试压电传感器
+        # 取消时不再自动关闭程序
 
     def select_files_for_video(self):
         """视频模式：选择视频文件和配置"""
@@ -878,9 +844,6 @@ class VideoPointCloudPlayer(QMainWindow):
             'base_3d_points': points_3d,
             'mirror_axis': mirror_axis,
         })
-        # 提取基准帧Delaunay拓扑边
-        self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
-        self.FRAME_DATA['right_edges'] = self.extract_edges(pts2_R.astype(np.float64))
 
         # 构建坐标系
         if len(points_3d) >= 3:
@@ -888,15 +851,16 @@ class VideoPointCloudPlayer(QMainWindow):
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
 
+        # 提取基准帧Delaunay拓扑边
+        self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
+        self.FRAME_DATA['right_edges'] = self.extract_edges(pts2_R.astype(np.float64))
+
         return True
 
     def start_camera(self):
         """启动摄像头"""
         self.camera_index = self.spin_camera_idx.value()
         self.rotate_180 = self.chk_rotate.isChecked()
-
-        # 记录视觉开始时间（用于与触觉同步）
-        self.visual_start_time = time.time()
 
         # 启动帧处理线程
         self.process_thread = FrameProcessThread()
@@ -918,11 +882,12 @@ class VideoPointCloudPlayer(QMainWindow):
         self.btn_play_pause.setText("暂停")
         self.btn_reset.setEnabled(True)
         self.btn_set_as_base.setEnabled(True)
+        self.btn_record.setEnabled(True)
         self.is_playing = True
 
         self.status_bar.showMessage(f"摄像头已启动 (ID: {self.camera_index})")
 
-    def on_camera_frame(self, frame):
+    def on_camera_frame(self, frame, timestamp=0.0):
         """处理摄像头帧 - 仅分发到处理线程，不直接显示"""
         if not self.FRAME_DATA['initialized']:
             return
@@ -948,14 +913,17 @@ class VideoPointCloudPlayer(QMainWindow):
 
         if self.is_playing and self.process_thread is not None:
             # 将帧发送到处理线程（异步处理）
-            self.process_thread.add_frame(frame.copy())
+            self.process_thread.add_frame(frame.copy(), timestamp)
         else:
             # 暂停时仅显示原始帧
             self.display_frame(frame)
 
-    def on_process_result(self, frame, points_3d, left_pts, right_pts, left_lost, right_lost):
+    def on_process_result(self, frame, points_3d, left_pts, right_pts, left_lost, right_lost, timestamp=0.0, is_abnormal=False):
         """处理线程返回结果 - 更新显示"""
         if points_3d is not None:
+            # 采集缓冲
+            self.buffer_frame_data(points_3d, timestamp, is_abnormal)
+
             # 更新带标记点的帧显示
             self.display_frame(frame, left_pts, right_pts, left_lost, right_lost)
 
@@ -1188,15 +1156,16 @@ class VideoPointCloudPlayer(QMainWindow):
             'base_3d_points': points_3d,
             'mirror_axis': mirror_axis,
         })
-        # 提取基准帧Delaunay拓扑边
-        self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
-        self.FRAME_DATA['right_edges'] = self.extract_edges(pts2_R.astype(np.float64))
 
         # 构建坐标系
         if len(points_3d) >= 3:
             origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
+
+        # 提取基准帧Delaunay拓扑边
+        self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
+        self.FRAME_DATA['right_edges'] = self.extract_edges(pts2_R.astype(np.float64))
 
         # 显示首帧
         self.current_frame_idx = 0
@@ -1207,6 +1176,7 @@ class VideoPointCloudPlayer(QMainWindow):
         self.btn_play_pause.setEnabled(True)
         self.btn_reset.setEnabled(True)
         self.btn_set_as_base.setEnabled(True)
+        self.btn_record.setEnabled(True)
         self.status_bar.showMessage(f"首帧处理完成，加载了{len(points_3d)}个标记点")
 
     def reset_first_frame(self):
@@ -1230,7 +1200,6 @@ class VideoPointCloudPlayer(QMainWindow):
             self.update_3d_view(self.FRAME_DATA['base_3d_points'])
 
         self.status_bar.showMessage("已重置参考点")
-        self.consecutive_abnormal_frames = 0
 
     def set_current_as_base(self):
         """将当前帧设置为新的基准帧"""
@@ -1264,10 +1233,6 @@ class VideoPointCloudPlayer(QMainWindow):
 
         self.FRAME_DATA['base_3d_points'] = points_3d
 
-        # 更新基准帧Delaunay拓扑边
-        self.FRAME_DATA['left_edges'] = self.extract_edges(left_pts.astype(np.float64))
-        self.FRAME_DATA['right_edges'] = self.extract_edges(right_pts.astype(np.float64))
-
         # 注意：不重新构建坐标系，保持原始坐标系不变
         # 这样可以确保坐标系始终一致，只更新基准3D点用于计算形变
 
@@ -1275,27 +1240,178 @@ class VideoPointCloudPlayer(QMainWindow):
         self.update_3d_view(points_3d)
 
         self.status_bar.showMessage(f"已将当前帧设置为新的基准帧（帧 {self.current_frame_idx}）")
-        self.consecutive_abnormal_frames = 0
+
+    # ---- HDF5 数据采集 ----
+    def toggle_recording(self):
+        """切换采集状态"""
+        if self.is_recording:
+            self.stop_recording()
+        else:
+            self.start_recording()
+
+    def start_recording(self):
+        """开始数据采集"""
+        if not self.FRAME_DATA['initialized']:
+            self.status_bar.showMessage("请先初始化首帧")
+            return
+
+        self.recording_buffer = {'timestamps': [], 'xyz': [], 'abnormal': []}
+        self.ft_recording_buffer = {'timestamps': [], 'ft_values': []}
+        self.is_recording = True
+        self.btn_record.setText("停止采集")
+        self.btn_record.setStyleSheet("background-color: #ff4444; color: white;")
+        self.status_bar.showMessage("数据采集中...")
+
+    def stop_recording(self):
+        """停止数据采集并保存HDF5"""
+        self.is_recording = False
+        self.btn_record.setText("开始采集")
+        self.btn_record.setStyleSheet("")
+        stop_time = datetime.now()
+        self.save_to_hdf5(stop_time)
+        self.save_ft_to_hdf5(stop_time)
+
+    def get_local_coords(self, points_3d):
+        """将3D点转换为可视化局部坐标（与update_3d_view一致）"""
+        if self.FRAME_DATA['transform_rotation'] is not None:
+            points = self.transform_to_local_coordinates(points_3d)
+            points[:, 0] = -points[:, 0]  # 沿x=0平面镜像
+            return points
+        return points_3d.copy()
+
+    def buffer_frame_data(self, points_3d, timestamp, is_abnormal=False):
+        """将当前帧数据写入采集缓冲区"""
+        if not self.is_recording or points_3d is None:
+            return
+        local_xyz = self.get_local_coords(points_3d)
+        self.recording_buffer['timestamps'].append(timestamp)
+        self.recording_buffer['xyz'].append(local_xyz.astype(np.float32))
+        self.recording_buffer['abnormal'].append(is_abnormal)
+
+    def save_to_hdf5(self, stop_time):
+        """将缓冲数据保存为HDF5文件"""
+        if not self.recording_buffer['timestamps']:
+            QMessageBox.warning(self, "警告", "没有采集到数据")
+            self.status_bar.showMessage("采集已停止（无数据）")
+            return
+
+        timestamps = np.array(self.recording_buffer['timestamps'], dtype=np.float64)
+        xyz_all = np.array(self.recording_buffer['xyz'], dtype=np.float32)  # (T, N, 3)
+        abnormal = np.array(self.recording_buffer['abnormal'], dtype=np.bool_)  # (T,)
+
+        # xyz_ref 绑定当前 base_3d_points
+        base_3d = self.FRAME_DATA['base_3d_points']
+        xyz_ref = self.get_local_coords(base_3d).astype(np.float32)  # (N, 3)
+
+        # 计算 dxyz
+        dxyz = (xyz_all - xyz_ref[np.newaxis, :, :]).astype(np.float32)  # (T, N, 3)
+
+        N = xyz_ref.shape[0]
+        point_id = np.arange(N, dtype=np.int32)
+
+        # 时间戳自动命名，保存到代码同级目录下的 force_calibration 文件夹
+        filename = f"calibration_{stop_time.strftime('%Y%m%d_%H%M%S')}.h5"
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, filename)
+
+        try:
+            with h5py.File(filepath, 'w') as f:
+                # /vision
+                vision = f.create_group('vision')
+                vision.create_dataset('timestamp', data=timestamps)
+                vision.create_dataset('xyz', data=xyz_all)
+                vision.create_dataset('dxyz', data=dxyz)
+                vision.create_dataset('point_id', data=point_id)
+                vision.create_dataset('abnormal', data=abnormal)  # 异常帧标记
+
+                # /reference
+                ref = f.create_group('reference')
+                ref.create_dataset('xyz_ref', data=xyz_ref)
+
+                # /meta
+                meta = f.create_group('meta')
+                meta.attrs['camera_fps'] = self.spin_speed.value()
+                meta.attrs['marker_count'] = N
+                meta.attrs['experiment_name'] = filename
+
+                # /force（预留扩展位置）
+                f.create_group('force')
+
+            self.recording_buffer = {'timestamps': [], 'xyz': [], 'abnormal': []}
+            QMessageBox.information(self, "保存成功",
+                f"数据已保存到:\n{filepath}\n\n帧数: {len(timestamps)}\nMarker数: {N}")
+            self.status_bar.showMessage(f"采集完成，已保存 {len(timestamps)} 帧到 {filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"写入HDF5文件失败:\n{e}")
+            self.status_bar.showMessage(f"保存失败: {e}")
+
+    def save_ft_to_hdf5(self, stop_time):
+        """将力传感器缓冲数据保存为单独的HDF5文件"""
+        with self.ft_lock:
+            ft_timestamps = self.ft_recording_buffer['timestamps'].copy()
+            ft_values = self.ft_recording_buffer['ft_values'].copy()
+
+        if not ft_timestamps:
+            print("力传感器无采集数据，跳过保存")
+            return
+
+        timestamps = np.array(ft_timestamps, dtype=np.float64)
+        values = np.array(ft_values, dtype=np.float64)  # (T, 6)
+
+        filename = f"ft_calibration_{stop_time.strftime('%Y%m%d_%H%M%S')}.h5"
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
+        os.makedirs(save_dir, exist_ok=True)
+        filepath = os.path.join(save_dir, filename)
+
+        try:
+            with h5py.File(filepath, 'w') as f:
+                # /force
+                force = f.create_group('force')
+                force.create_dataset('timestamp', data=timestamps)
+                force.create_dataset('values', data=values)  # (T, 6): fx,fy,fz,mx,my,mz
+                force.attrs['columns'] = 'fx,fy,fz,mx,my,mz'
+
+                # /meta
+                meta = f.create_group('meta')
+                meta.attrs['experiment_name'] = filename
+                meta.attrs['sample_count'] = len(timestamps)
+
+            with self.ft_lock:
+                self.ft_recording_buffer = {'timestamps': [], 'ft_values': []}
+
+            QMessageBox.information(self, "力传感器数据保存成功",
+                f"数据已保存到:\n{filepath}\n\n采样数: {len(timestamps)}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", f"写入力传感器HDF5文件失败:\n{e}")
 
     def process_frame(self, frame):
-        """处理后续帧"""
+        """处理后续帧 - 带mesh untangling和灾难性崩溃检测"""
         if not self.FRAME_DATA['initialized']:
-            return None, None, None, None, None
+            return None, None, None, None, None, False
+
         h, w = frame.shape[:2]
         mirror_axis = self.FRAME_DATA['mirror_axis']
+
+        # 生成镜像视图
         left_img = np.full((h, w, 3), 255, dtype=np.uint8)
         left_img[:, :mirror_axis] = frame[:, :mirror_axis]
         right_img = np.full((h, w, 3), 255, dtype=np.uint8)
         right_img[:, mirror_axis:] = frame[:, mirror_axis:]
+
+        # 检测标记点
         left_pts_det_raw = np.array([(x, y) for (x, y, _) in
                                   self.apply_roi_mask(self.detector.detect(left_img),
                                                       self.drawing['left']['mask'])], dtype=np.float32)
         right_pts_det_raw = np.array([(x, y) for (x, y, _) in
                                    self.apply_roi_mask(self.detector.detect(right_img),
                                                        self.drawing['right']['mask'])], dtype=np.float32)
+
+        # 过滤掉距离所有参考点都太远的检测点
         pre_l = self.FRAME_DATA['left_points_0_pre']
         pre_r = self.FRAME_DATA['right_points_0_pre']
         filter_dist = self.max_match_dist * 1.5
+
         if len(left_pts_det_raw) > 0 and len(pre_l) > 0:
             dist_matrix_l = cdist(left_pts_det_raw, pre_l)
             min_dists_l = np.min(dist_matrix_l, axis=1)
@@ -1303,6 +1419,7 @@ class VideoPointCloudPlayer(QMainWindow):
             left_pts_det = left_pts_det_raw[valid_mask_l]
         else:
             left_pts_det = left_pts_det_raw
+
         if len(right_pts_det_raw) > 0 and len(pre_r) > 0:
             dist_matrix_r = cdist(right_pts_det_raw, pre_r)
             min_dists_r = np.min(dist_matrix_r, axis=1)
@@ -1310,13 +1427,24 @@ class VideoPointCloudPlayer(QMainWindow):
             right_pts_det = right_pts_det_raw[valid_mask_r]
         else:
             right_pts_det = right_pts_det_raw
-        matched_pairs = self.auto_match_points(left_pts_det, right_pts_det, pre_l, pre_r, self.max_match_dist)
+
+        # 匹配
+        matched_pairs = self.auto_match_points(
+            left_pts_det, right_pts_det,
+            self.FRAME_DATA['left_points_0_pre'],
+            self.FRAME_DATA['right_points_0_pre'],
+            max_dist=self.max_match_dist
+        )
+
+        # 局部近邻运动补偿
         found_indices = [idx for idx, (i, j) in enumerate(matched_pairs) if i != 100 and j != 100]
         lost_indices = [idx for idx, (i, j) in enumerate(matched_pairs) if i == 100 or j == 100]
+
         left_points_R = np.zeros_like(pre_l)
         right_points_R = np.zeros_like(pre_r)
         left_lost_mask = np.zeros(len(pre_l), dtype=bool)
         right_lost_mask = np.zeros(len(pre_r), dtype=bool)
+
         found_diffs_l = []
         found_diffs_r = []
         for idx in found_indices:
@@ -1325,13 +1453,16 @@ class VideoPointCloudPlayer(QMainWindow):
             right_points_R[idx] = right_pts_det[det_j]
             found_diffs_l.append(left_points_R[idx] - pre_l[idx])
             found_diffs_r.append(right_points_R[idx] - pre_r[idx])
+
         if len(found_indices) > 0:
             found_diffs_l = np.array(found_diffs_l)
             found_diffs_r = np.array(found_diffs_r)
             found_pre_l = pre_l[found_indices]
             found_pre_r = pre_r[found_indices]
+
             for idx in lost_indices:
                 det_i, det_j = matched_pairs[idx]
+
                 if det_i == 100:
                     left_lost_mask[idx] = True
                     dists_l = np.linalg.norm(found_pre_l - pre_l[idx], axis=1)
@@ -1341,6 +1472,7 @@ class VideoPointCloudPlayer(QMainWindow):
                     left_points_R[idx] = pre_l[idx] + local_move_l
                 else:
                     left_points_R[idx] = left_pts_det[det_i]
+
                 if det_j == 100:
                     right_lost_mask[idx] = True
                     dists_r = np.linalg.norm(found_pre_r - pre_r[idx], axis=1)
@@ -1356,180 +1488,122 @@ class VideoPointCloudPlayer(QMainWindow):
             left_lost_mask[:] = True
             right_lost_mask[:] = True
 
-        # ── 平面图约束 Mesh Untangling ──
-        left_edges = self.FRAME_DATA.get('left_edges') or []
-        right_edges = self.FRAME_DATA.get('right_edges') or []
+        # ---- Mesh untangling：基于拓扑边检测交叉并修复 ----
+        left_edges = self.FRAME_DATA.get('left_edges', [])
+        right_edges = self.FRAME_DATA.get('right_edges', [])
 
-        def find_crossing_pairs(pts, edges):
+        def count_crossings(pts, edges):
             crossings = []
-            n = len(edges)
-            if n == 0:
-                return crossings
-            bboxes = np.empty((n, 4), dtype=np.float64)
-            for i, (a, b) in enumerate(edges):
-                ax, ay = pts[a][0], pts[a][1]
-                bx, by = pts[b][0], pts[b][1]
-                bboxes[i, 0] = min(ax, bx)
-                bboxes[i, 1] = max(ax, bx)
-                bboxes[i, 2] = min(ay, by)
-                bboxes[i, 3] = max(ay, by)
-            for i in range(n):
-                a, b = edges[i]
-                p1, p2 = pts[a], pts[b]
-                for j in range(i + 1, n):
-                    c, d = edges[j]
-                    if a == c or a == d or b == c or b == d:
+            for i in range(len(edges)):
+                a1, b1 = edges[i]
+                for j in range(i + 1, len(edges)):
+                    a2, b2 = edges[j]
+                    if a1 == a2 or a1 == b2 or b1 == a2 or b1 == b2:
                         continue
-                    if (bboxes[i, 1] < bboxes[j, 0] or bboxes[j, 1] < bboxes[i, 0] or
-                            bboxes[i, 3] < bboxes[j, 2] or bboxes[j, 3] < bboxes[i, 2]):
-                        continue
-                    if self.segments_intersect(p1, p2, pts[c], pts[d]):
-                        crossings.append((i, j))
+                    if self.segments_intersect(pts[a1], pts[b1], pts[a2], pts[b2]):
+                        crossings.append((i, j, a1, b1, a2, b2))
             return crossings
 
-        def untangle(pts_R, lost_mask, edges, matched_pairs_ref, side):
-            MAX_ITER = 5
-            for _ in range(MAX_ITER):
-                crossings = find_crossing_pairs(pts_R, edges)
+        def untangle(pts, edges, max_iter=5):
+            pts = pts.copy()
+            for _ in range(max_iter):
+                crossings = count_crossings(pts, edges)
                 if not crossings:
-                    break
-                resolved_any = False
-                for ei, ej in crossings:
-                    a, b = edges[ei]
-                    c, d = edges[ej]
-                    candidates = [(a, c), (a, d), (b, c), (b, d)]
-                    for p, q in candidates:
-                        p_lost = lost_mask[p]
-                        q_lost = lost_mask[q]
-                        if p_lost or q_lost:
-                            for lost_idx in ([p] if p_lost else []) + ([q] if q_lost else []):
-                                neighbors = []
-                                for ea, eb in edges:
-                                    if ea == lost_idx and not lost_mask[eb]:
-                                        neighbors.append(eb)
-                                    elif eb == lost_idx and not lost_mask[ea]:
-                                        neighbors.append(ea)
-                                if not neighbors:
-                                    continue
-                                crossing_nodes = set()
-                                for ci, cj in crossings:
-                                    for nd in edges[ci] + edges[cj]:
-                                        crossing_nodes.add(nd)
-                                safe_neighbors = [n for n in neighbors if n not in crossing_nodes]
-                                if not safe_neighbors:
-                                    continue
-                                base_pts = self.FRAME_DATA['left_points_0_R'] if side == 'left' \
-                                    else self.FRAME_DATA['right_points_0_R']
-                                moves = [pts_R[n] - base_pts[n] for n in safe_neighbors]
-                                median_move = np.median(moves, axis=0)
-                                safe_pos = base_pts[lost_idx] + median_move
-                                pts_R[lost_idx] = 0.5 * pts_R[lost_idx] + 0.5 * safe_pos
-                            resolved_any = True
-                            break
-                        pts_R_trial = pts_R.copy()
-                        pts_R_trial[p], pts_R_trial[q] = pts_R[q].copy(), pts_R[p].copy()
-                        new_crossings = find_crossing_pairs(pts_R_trial, edges)
-                        new_cross_set = set(map(tuple, new_crossings))
-                        old_cross_set = set(map(tuple, crossings))
-                        if (ei, ej) not in new_cross_set and len(new_cross_set) < len(old_cross_set):
-                            pts_R[p], pts_R[q] = pts_R_trial[p].copy(), pts_R_trial[q].copy()
-                            resolved_any = True
-                            break
-                    if resolved_any:
-                        break
-                if not resolved_any:
-                    break
+                    return pts, []
+                for _, _, a1, b1, a2, b2 in crossings:
+                    pts[b1], pts[b2] = pts[b2].copy(), pts[b1].copy()
+                crossings = count_crossings(pts, edges)
+                if not crossings:
+                    return pts, []
+            return pts, crossings
 
-        # ── 灾难性熔断检测 ──
-        num_total = len(pre_l)
-        num_lost = int(np.sum(left_lost_mask) + np.sum(right_lost_mask))
-        lost_ratio = num_lost / (num_total * 2) if num_total > 0 else 1.0
-        left_initial_crossings = find_crossing_pairs(left_points_R, left_edges) if left_edges else []
-        right_initial_crossings = find_crossing_pairs(right_points_R, right_edges) if right_edges else []
-        is_catastrophic = (lost_ratio > 0.5 or
-                           len(left_initial_crossings) > 20 or
-                           len(right_initial_crossings) > 20)
+        left_crossings = []
+        right_crossings = []
+
+        if left_edges:
+            left_points_R, left_crossings = untangle(left_points_R, left_edges)
+        if right_edges:
+            right_points_R, right_crossings = untangle(right_points_R, right_edges)
+
+        self.FRAME_DATA['current_left_crossings'] = left_crossings
+        self.FRAME_DATA['current_right_crossings'] = right_crossings
+
+        # ---- 灾难性崩溃检测 ----
+        n_total = len(pre_l)
+        lost_ratio = len(lost_indices) / max(n_total, 1)
+        total_crossings = len(left_crossings) + len(right_crossings)
+        is_catastrophic = (lost_ratio > 0.5 or total_crossings > 20)
 
         if is_catastrophic:
-            self.FRAME_DATA['current_left_crossings'] = left_initial_crossings
-            self.FRAME_DATA['current_right_crossings'] = right_initial_crossings
+            self.consecutive_abnormal_frames += 1
         else:
-            if left_edges:
-                untangle(left_points_R, left_lost_mask, left_edges, matched_pairs, 'left')
-            if right_edges:
-                untangle(right_points_R, right_lost_mask, right_edges, matched_pairs, 'right')
-            self.FRAME_DATA['current_left_crossings'] = (
-                find_crossing_pairs(left_points_R, left_edges) if left_edges else [])
-            self.FRAME_DATA['current_right_crossings'] = (
-                find_crossing_pairs(right_points_R, right_edges) if right_edges else [])
-
-        if not is_catastrophic:
-            left_points_R = left_points_R.astype(np.float32)
-            right_points_R = right_points_R.astype(np.float32)
-            K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
-            K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-            R, T = self.stereo_params['R'], self.stereo_params['T']
-            R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                         flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
-            l_pts_ud = cv2.undistortPoints(left_points_R, K1, D1, R=R1, P=P1).squeeze()
-            r_pts_ud = cv2.undistortPoints(right_points_R, K2, D2, R=R2, P=P2).squeeze()
-            points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
-
-            base_3d = self.FRAME_DATA['base_3d_points']
-            is_abnormal = False
-            abnormal_reason = []
-            if base_3d is not None and len(points_3d) == len(base_3d):
-                z_diff = points_3d[:, 2] - base_3d[:, 2]
-                if np.any(z_diff > 1.0):
-                    is_abnormal = True
-                    abnormal_reason.append(f"Z轴深度异常")
-                if not is_abnormal and len(points_3d) >= 2:
-                    from scipy.spatial.distance import pdist
-                    distances = pdist(points_3d)
-                    if np.any(distances < 0.3):
-                        is_abnormal = True
-                        abnormal_reason.append(f"点间距异常")
-        else:
-            is_abnormal = True
-            abnormal_reason = ["灾难性熔断"]
-            base_3d = self.FRAME_DATA['base_3d_points']
-
-        # ── 连续异常帧计数与分级处理 ──
-        if not is_abnormal:
             self.consecutive_abnormal_frames = 0
-            self.FRAME_DATA['left_points_0_pre'] = left_points_R
-            self.FRAME_DATA['right_points_0_pre'] = right_points_R
-            return points_3d, left_points_R, right_points_R, left_lost_mask, right_lost_mask
 
-        self.consecutive_abnormal_frames += 1
-
-        if self.consecutive_abnormal_frames >= 5:
-            self.FRAME_DATA['left_points_0_pre'] = self.FRAME_DATA['left_points_0_R'].copy()
-            self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
-            self.consecutive_abnormal_frames = 0
-            n_pts = len(base_3d) if base_3d is not None else len(self.FRAME_DATA['left_points_0_R'])
+        # ---- 分级异常帧处理 ----
+        if self.consecutive_abnormal_frames > 0 and self.consecutive_abnormal_frames < 5:
+            # 时间冻结：保持上一帧数据不变，不更新参考点
             return (self.FRAME_DATA['base_3d_points'].copy(),
                     self.FRAME_DATA['left_points_0_R'].copy(),
                     self.FRAME_DATA['right_points_0_R'].copy(),
-                    np.ones(n_pts, dtype=bool),
-                    np.ones(n_pts, dtype=bool))
-        else:
-            prev_left = self.FRAME_DATA['left_points_0_pre']
-            prev_right = self.FRAME_DATA['right_points_0_pre']
-            K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
-            K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-            R, T = self.stereo_params['R'], self.stereo_params['T']
-            R1, R2, P1_prev, P2_prev, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                                    flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
-            l_pts_ud_prev = cv2.undistortPoints(prev_left, K1, D1, R=R1, P=P1_prev).squeeze()
-            r_pts_ud_prev = cv2.undistortPoints(prev_right, K2, D2, R=R2, P=P2_prev).squeeze()
-            points_3d_prev = self.linear_triangulation(l_pts_ud_prev, r_pts_ud_prev, P1_prev, P2_prev)
-            n_pts = len(base_3d) if base_3d is not None else len(prev_left)
-            return (points_3d_prev,
-                    prev_left.copy(),
-                    prev_right.copy(),
-                    np.ones(n_pts, dtype=bool),
-                    np.ones(n_pts, dtype=bool))
+                    np.zeros(n_total, dtype=bool),
+                    np.zeros(n_total, dtype=bool),
+                    True)
+
+        if self.consecutive_abnormal_frames >= 5:
+            # 强制重置：连续异常超过5帧，重置参考点到首帧
+            self.FRAME_DATA['left_points_0_pre'] = self.FRAME_DATA['left_points_0_R'].copy()
+            self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
+            self.consecutive_abnormal_frames = 0
+            return (self.FRAME_DATA['base_3d_points'].copy(),
+                    self.FRAME_DATA['left_points_0_R'].copy(),
+                    self.FRAME_DATA['right_points_0_R'].copy(),
+                    np.zeros(n_total, dtype=bool),
+                    np.zeros(n_total, dtype=bool),
+                    True)
+
+        # 三维重建
+        left_points_R = left_points_R.astype(np.float32)
+        right_points_R = right_points_R.astype(np.float32)
+
+        K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
+        K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
+        R, T = self.stereo_params['R'], self.stereo_params['T']
+
+        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
+                                                     flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+        l_pts_ud = cv2.undistortPoints(left_points_R, K1, D1, R=R1, P=P1).squeeze()
+        r_pts_ud = cv2.undistortPoints(right_points_R, K2, D2, R=R2, P=P2).squeeze()
+        points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
+
+        # 异常帧检测（3D层面）
+        base_3d = self.FRAME_DATA['base_3d_points']
+        is_abnormal = False
+
+        if base_3d is not None and len(points_3d) == len(base_3d):
+            z_diff = points_3d[:, 2] - base_3d[:, 2]
+            if np.any(z_diff > 1.0):
+                is_abnormal = True
+
+            if not is_abnormal and len(points_3d) >= 2:
+                distances = pdist(points_3d)
+                if np.any(distances < 0.3):
+                    is_abnormal = True
+
+            if is_abnormal:
+                self.FRAME_DATA['left_points_0_pre'] = self.FRAME_DATA['left_points_0_R'].copy()
+                self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
+                return (self.FRAME_DATA['base_3d_points'].copy(),
+                        self.FRAME_DATA['left_points_0_R'].copy(),
+                        self.FRAME_DATA['right_points_0_R'].copy(),
+                        np.zeros(len(base_3d), dtype=bool),
+                        np.zeros(len(base_3d), dtype=bool),
+                        True)
+
+        # 更新参考点
+        self.FRAME_DATA['left_points_0_pre'] = left_points_R
+        self.FRAME_DATA['right_points_0_pre'] = right_points_R
+
+        return points_3d, left_points_R, right_points_R, left_lost_mask, right_lost_mask, False
 
     def apply_roi_mask(self, points, mask):
         """应用ROI掩膜"""
@@ -1567,6 +1641,50 @@ class VideoPointCloudPlayer(QMainWindow):
             X = X_homo[:3] / X_homo[3]
             points_3d[i] = X
         return points_3d
+
+    @staticmethod
+    def extract_edges(points_2d):
+        """从2D点集提取Delaunay三角剖分的去重边列表，并过滤幽灵长边。"""
+        if len(points_2d) < 3:
+            return []
+        pts = np.asarray(points_2d, dtype=np.float64)
+        try:
+            tri = Delaunay(pts)
+        except Exception:
+            return []
+        edges = set()
+        for simplex in tri.simplices:
+            a, b, c = int(simplex[0]), int(simplex[1]), int(simplex[2])
+            edges.add((min(a, b), max(a, b)))
+            edges.add((min(b, c), max(b, c)))
+            edges.add((min(a, c), max(a, c)))
+        edge_list = list(edges)
+        lengths = np.array([np.linalg.norm(pts[a] - pts[b]) for a, b in edge_list])
+        threshold = np.median(lengths) * 1.3
+        return [e for e, l in zip(edge_list, lengths) if l <= threshold]
+
+    @staticmethod
+    def segments_intersect(p1, p2, p3, p4):
+        """判断线段 p1p2 与线段 p3p4 是否真正相交。"""
+        if (max(p1[0], p2[0]) < min(p3[0], p4[0]) or
+                max(p3[0], p4[0]) < min(p1[0], p2[0]) or
+                max(p1[1], p2[1]) < min(p3[1], p4[1]) or
+                max(p3[1], p4[1]) < min(p1[1], p2[1])):
+            return False
+        eps = 3.0
+
+        def cross2d(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        d1 = cross2d(p3, p4, p1)
+        d2 = cross2d(p3, p4, p2)
+        d3 = cross2d(p1, p2, p3)
+        d4 = cross2d(p1, p2, p4)
+
+        if ((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps)) and \
+           ((d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)):
+            return True
+        return False
 
     def auto_match_points(self, left_points, right_points, left_pre, right_pre, max_dist=100):
         """自动匹配点 - 使用全局匈牙利算法"""
@@ -1635,50 +1753,6 @@ class VideoPointCloudPlayer(QMainWindow):
 
         return matched
 
-    @staticmethod
-    def extract_edges(points_2d):
-        """从2D点集提取Delaunay三角剖分的去重边列表，并过滤幽灵长边。"""
-        if len(points_2d) < 3:
-            return []
-        pts = np.asarray(points_2d, dtype=np.float64)
-        try:
-            tri = Delaunay(pts)
-        except Exception:
-            return []
-        edges = set()
-        for simplex in tri.simplices:
-            a, b, c = int(simplex[0]), int(simplex[1]), int(simplex[2])
-            edges.add((min(a, b), max(a, b)))
-            edges.add((min(b, c), max(b, c)))
-            edges.add((min(a, c), max(a, c)))
-        edge_list = list(edges)
-        lengths = np.array([np.linalg.norm(pts[a] - pts[b]) for a, b in edge_list])
-        threshold = np.median(lengths) * 1.3
-        return [e for e, l in zip(edge_list, lengths) if l <= threshold]
-
-    @staticmethod
-    def segments_intersect(p1, p2, p3, p4):
-        """判断线段 p1p2 与线段 p3p4 是否真正相交。"""
-        if (max(p1[0], p2[0]) < min(p3[0], p4[0]) or
-                max(p3[0], p4[0]) < min(p1[0], p2[0]) or
-                max(p1[1], p2[1]) < min(p3[1], p4[1]) or
-                max(p3[1], p4[1]) < min(p1[1], p2[1])):
-            return False
-        eps = 3.0
-
-        def cross2d(o, a, b):
-            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
-
-        d1 = cross2d(p3, p4, p1)
-        d2 = cross2d(p3, p4, p2)
-        d3 = cross2d(p1, p2, p3)
-        d4 = cross2d(p1, p2, p4)
-
-        if ((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps)) and \
-           ((d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)):
-            return True
-        return False
-
     def build_coordinate_system_pca(self, points_3d):
         """使用PCA构建坐标系"""
         centroid = np.mean(points_3d, axis=0)
@@ -1715,29 +1789,37 @@ class VideoPointCloudPlayer(QMainWindow):
         """显示帧"""
         display_img = frame.copy()
 
-        # 绘制Delaunay拓扑网格连线
-        left_edges = self.FRAME_DATA.get('left_edges') or []
-        right_edges = self.FRAME_DATA.get('right_edges') or []
+        # 绘制Delaunay mesh边（在标记点之前绘制，这样点在边之上）
+        left_edges = self.FRAME_DATA.get('left_edges', [])
+        right_edges = self.FRAME_DATA.get('right_edges', [])
+        left_crossings = self.FRAME_DATA.get('current_left_crossings', [])
+        right_crossings = self.FRAME_DATA.get('current_right_crossings', [])
+
+        # 收集交叉边索引
+        left_cross_set = set()
+        for item in left_crossings:
+            left_cross_set.add(item[0])
+            left_cross_set.add(item[1])
+        right_cross_set = set()
+        for item in right_crossings:
+            right_cross_set.add(item[0])
+            right_cross_set.add(item[1])
+
         if left_pts is not None and left_edges:
-            crossing_left = set()
-            for ei, ej in self.FRAME_DATA.get('current_left_crossings', []):
-                crossing_left.add(ei)
-                crossing_left.add(ej)
-            for k, (a, b) in enumerate(left_edges):
-                pa = (int(left_pts[a][0]), int(left_pts[a][1]))
-                pb = (int(left_pts[b][0]), int(left_pts[b][1]))
-                color = (0, 0, 220) if k in crossing_left else (200, 180, 80)
-                cv2.line(display_img, pa, pb, color, 1, cv2.LINE_AA)
+            for ei, (a, b) in enumerate(left_edges):
+                if a < len(left_pts) and b < len(left_pts):
+                    p1 = (int(left_pts[a][0]), int(left_pts[a][1]))
+                    p2 = (int(left_pts[b][0]), int(left_pts[b][1]))
+                    color = (0, 0, 255) if ei in left_cross_set else (180, 180, 180)
+                    cv2.line(display_img, p1, p2, color, 1)
+
         if right_pts is not None and right_edges:
-            crossing_right = set()
-            for ei, ej in self.FRAME_DATA.get('current_right_crossings', []):
-                crossing_right.add(ei)
-                crossing_right.add(ej)
-            for k, (a, b) in enumerate(right_edges):
-                pa = (int(right_pts[a][0]), int(right_pts[a][1]))
-                pb = (int(right_pts[b][0]), int(right_pts[b][1]))
-                color = (0, 0, 220) if k in crossing_right else (80, 200, 80)
-                cv2.line(display_img, pa, pb, color, 1, cv2.LINE_AA)
+            for ei, (a, b) in enumerate(right_edges):
+                if a < len(right_pts) and b < len(right_pts):
+                    p1 = (int(right_pts[a][0]), int(right_pts[a][1]))
+                    p2 = (int(right_pts[b][0]), int(right_pts[b][1]))
+                    color = (0, 0, 255) if ei in right_cross_set else (180, 180, 180)
+                    cv2.line(display_img, p1, p2, color, 1)
 
         # 绘制标记点
         if left_pts is not None:
@@ -1891,10 +1973,6 @@ class VideoPointCloudPlayer(QMainWindow):
         self.is_playing = True
         self.btn_play_pause.setText("暂停")
 
-        # 记录视觉开始时间（用于与触觉同步）
-        if self.visual_start_time is None:
-            self.visual_start_time = time.time()
-
         if self.input_mode == 'video':
             interval = int(1000 / self.spin_speed.value())
             self.play_timer.start(interval)
@@ -1928,6 +2006,7 @@ class VideoPointCloudPlayer(QMainWindow):
 
         self.video_cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame_idx)
         ret, frame = self.video_cap.read()
+        frame_timestamp = time.time()
         if not ret:
             self.pause_playback()
             return
@@ -1936,12 +2015,14 @@ class VideoPointCloudPlayer(QMainWindow):
             # 首帧直接显示
             self.display_frame(frame, self.FRAME_DATA['left_points_0_R'], self.FRAME_DATA['right_points_0_R'])
             self.update_3d_view(self.FRAME_DATA['base_3d_points'])
+            self.buffer_frame_data(self.FRAME_DATA['base_3d_points'], frame_timestamp, False)
         else:
             # 处理后续帧
-            points_3d, left_pts, right_pts, left_lost, right_lost = self.process_frame(frame)
+            points_3d, left_pts, right_pts, left_lost, right_lost, is_abnormal = self.process_frame(frame)
             if points_3d is not None:
                 self.display_frame(frame, left_pts, right_pts, left_lost, right_lost)
                 self.update_3d_view(points_3d)
+                self.buffer_frame_data(points_3d, frame_timestamp, is_abnormal)
 
         self.slider_progress.blockSignals(True)
         self.slider_progress.setValue(self.current_frame_idx)
@@ -1996,7 +2077,7 @@ class VideoPointCloudPlayer(QMainWindow):
                 points_3d = self.FRAME_DATA['base_3d_points']
                 left_lost = right_lost = None
             else:
-                points_3d, left_pts, right_pts, left_lost, right_lost = self.process_frame(frame)
+                points_3d, left_pts, right_pts, left_lost, right_lost, _abnormal = self.process_frame(frame)
 
         self.current_frame_idx = frame_idx
         if points_3d is not None:
@@ -2043,147 +2124,57 @@ class VideoPointCloudPlayer(QMainWindow):
                     self.play_timer.start(interval)
                 self._was_playing_before_drag = False
 
-    # ---- 触觉传感器相关方法 ----
-    def get_serial_ports(self):
-        """获取可用的串口端口"""
-        ports = serial.tools.list_ports.comports()
-        return [port.device for port in ports]
-
-    def refresh_serial_ports(self):
-        """刷新串口列表"""
-        self.cbb_serial_port.clear()
-        self.cbb_serial_port.addItems(self.get_serial_ports())
-
-    def start_serial_reading(self):
-        """启动串口数据读取"""
-        port = self.cbb_serial_port.currentText()
-        if not port:
-            QMessageBox.warning(self, "警告", "请选择串口")
-            return
-        baudrate = int(self.cbb_serial_baud.currentText())
-
-        # 清空数据
-        self.data_ptac_adc1 = []
-        self.data_ptac_adc2 = []
-        self.data_ptac_adc3 = []
-        self.data_ptac_adc4 = []
-        self.data_ptac_adc5 = []
-        self.tactile_timestamps = []
-
-        # 记录开始时间（与视觉同步）
-        self.tactile_start_time = time.time()
-        if self.visual_start_time is None:
-            self.visual_start_time = self.tactile_start_time
-
-        if self.serial_receiver is None or not self.serial_receiver.isRunning():
-            self.serial_receiver = SerialReceiver(port, baudrate)
-            self.serial_receiver.data_received.connect(self.update_tactile_data)
-            self.serial_receiver.start()
-            self.status_bar.showMessage(f"串口已连接: {port}")
-
-    def stop_serial_reading(self):
-        """停止串口数据读取"""
-        if self.serial_receiver and self.serial_receiver.isRunning():
-            self.serial_receiver.stop()
-            self.status_bar.showMessage("串口已断开")
-
-    def update_tactile_data(self, data_frame_datas, timestamp):
-        """更新触觉传感器数据"""
-        flag_adc = data_frame_datas[0]
-        data_frame = data_frame_datas[1:]
-
-        REFERENCE_VOLTAGE = 3.3
-        MAX_VALUE = 2 ** 23
-
-        decimal_data = []
-        for i in range(0, len(data_frame), 3):
-            value = data_frame[i:i + 3]
-            decimal_value = self.bytes_to_decimal(value)
-            voltage = (decimal_value / MAX_VALUE) * REFERENCE_VOLTAGE
-            decimal_data.append(voltage)
-
-        # 记录时间戳
-        self.tactile_timestamps.append(timestamp)
-
-        if flag_adc == 0:
-            self.data_ptac_adc1.append(decimal_data)
-        elif flag_adc == 1:
-            self.data_ptac_adc2.append(decimal_data)
-        elif flag_adc == 2:
-            self.data_ptac_adc3.append(decimal_data)
-        elif flag_adc == 3:
-            self.data_ptac_adc4.append(decimal_data)
-        elif flag_adc == 4:
-            self.data_ptac_adc5.append(decimal_data)
-
-    def bytes_to_decimal(self, data):
-        """将字节数据转换为十进制"""
-        byte1, byte2, byte3 = data
-        adc_value = (byte1 << 16) | (byte2 << 8) | byte3
-        if adc_value & 0x800000:
-            adc_value -= 0x1000000
-        return adc_value
-
-    def update_tactile_plot(self):
-        """更新触觉信号图表"""
-        group_index = self.cbb_adc_group.currentIndex()
-        if group_index == 0:
-            data_adc_i = self.data_ptac_adc1
-        elif group_index == 1:
-            data_adc_i = self.data_ptac_adc2
-        elif group_index == 2:
-            data_adc_i = self.data_ptac_adc3
-        elif group_index == 3:
-            data_adc_i = self.data_ptac_adc4
-        elif group_index == 4:
-            data_adc_i = self.data_ptac_adc5
-        else:
-            data_adc_i = []
-
-        if not data_adc_i:
-            return
-
-        # 获取用户选择的通道（1-8，转换为索引0-7）
-        selected_channels = [
-            self.spin_ch1.value() - 1,
-            self.spin_ch2.value() - 1,
-            self.spin_ch3.value() - 1
-        ]
-
-        # 仅绘制最近的 2000 个点
-        display_data = data_adc_i[-2000:]
-        num_points = len(display_data)
-        # 使用连续整数索引作为x轴，让最新点在x=0处
-        x_axis = list(range(-num_points + 1, 1))
-
-        for i, curve in enumerate(self.tactile_curves):
-            ch_idx = selected_channels[i]  # 获取用户选择的通道索引
-            # 更新图表标题
-            self.tactile_plots[i].setTitle(f"CH:{ch_idx + 1}", color='k', size='10pt')
-            # 获取对应通道的数据
-            y_data = [row[ch_idx] for row in display_data if len(row) > ch_idx]
-            if len(y_data) > 0:
-                curve.setData(x_axis[:len(y_data)], y_data)
-
     def closeEvent(self, event):
         """关闭窗口"""
-        # 停止触觉传感器
-        if self.serial_receiver is not None:
-            self.serial_receiver.stop()
-        self.tactile_timer.stop()
-
+        # 如果正在采集，先停止并保存
+        if self.is_recording:
+            self.stop_recording()
+        # 停止力传感器显示刷新
+        self.ft_display_timer.stop()
+        # 停止播放定时器
+        self.play_timer.stop()
+        # 关闭力传感器订阅
+        if self.ft_node is not None:
+            # 先清除订阅引用，阻止回调继续触发
+            self.ft_subscription = None
+            try:
+                self.ft_node.Shutdown()
+            except Exception:
+                pass
+            self.ft_node = None
+        # 先设置 running=False 让线程自行退出，再 wait
         if self.process_thread is not None:
-            self.process_thread.stop()
+            self.process_thread.running = False
+            self.process_thread.has_new_frame.set()
         if self.camera_thread is not None:
-            self.camera_thread.stop()
+            self.camera_thread.running = False
+        # 释放视频资源（这样 camera_thread 的 read() 能更快返回）
         if self.video_cap:
             self.video_cap.release()
-        self.play_timer.stop()
+            self.video_cap = None
+        # 等待线程结束
+        if self.process_thread is not None:
+            self.process_thread.stop()
+            self.process_thread = None
+        if self.camera_thread is not None:
+            self.camera_thread.stop()
+            self.camera_thread = None
         event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    # 让 Ctrl+C 能正常关闭程序
+    signal.signal(signal.SIGINT, lambda *args: app.quit())
+    # 需要一个定时器让 Python 有机会处理信号
+    sigint_timer = QTimer()
+    sigint_timer.timeout.connect(lambda: None)
+    sigint_timer.start(200)
+
     window = VideoPointCloudPlayer()
     window.show()
-    sys.exit(app.exec_())
+    ret = app.exec_()
+
+    # 强制退出，确保 ZMQ/订阅残留线程不会阻止进程结束
+    os._exit(ret)

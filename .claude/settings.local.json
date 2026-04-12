@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''V4_VpTac-direction.py'', doraise=True\\); print\\(''语法检查通过''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''V7_Vptac-force-predict.py'', doraise=True\\); print\\(''语法检查通过''\\)\")",
+      "Bash(python -c:*)"
+    ]
+  }
+}

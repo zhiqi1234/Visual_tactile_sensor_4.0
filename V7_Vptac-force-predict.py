@@ -38,7 +38,8 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from scipy.spatial.distance import cdist
+from scipy.spatial.distance import cdist, pdist
+from scipy.spatial import Delaunay
 from scipy.optimize import linear_sum_assignment
 
 from V6_force_predict import ForcePredictor
@@ -164,50 +165,86 @@ class CircleDetector:
             if verbose:
                 print("⚠ 未找到参数文件，使用系统默认参数")
 
+    def _detect_by_local_minima(self, gray, blur):
+        """局部极小值检测方法"""
+        min_area = self.params["min_area"]
+        avg_radius = max(3, int(np.sqrt(min_area / np.pi)))
+        win = avg_radius * 2 + 1
+
+        smooth = cv2.GaussianBlur(blur, (3, 3), 0)
+        local_min = cv2.erode(smooth, np.ones((win, win), np.uint8))
+        minima_mask = (smooth == local_min).astype(np.uint8) * 255
+
+        block = max(7, win * 3 | 1)
+        dark_mask = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                          cv2.THRESH_BINARY_INV, block, self.params["c_val"])
+        minima_mask = cv2.bitwise_and(minima_mask, dark_mask)
+
+        dilate_k = max(2, avg_radius)
+        minima_mask = cv2.dilate(minima_mask, np.ones((dilate_k, dilate_k), np.uint8))
+
+        contours, _ = cv2.findContours(minima_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        points = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < 1:
+                continue
+            M = cv2.moments(cnt)
+            if M['m00'] > 0:
+                cx = int(M['m10'] / M['m00'])
+                cy = int(M['m01'] / M['m00'])
+                points.append((cx, cy, avg_radius))
+        return points
+
+    def _remove_duplicate_points(self, points, min_distance):
+        """移除距离过近的重复点，只保留一个"""
+        if len(points) <= 1:
+            return points
+
+        from scipy.spatial import cKDTree
+
+        points_arr = np.array([(x, y) for x, y, _ in points], dtype=np.float32)
+        tree = cKDTree(points_arr)
+
+        # 找出所有距离小于min_distance的点对
+        pairs = tree.query_pairs(min_distance)
+
+        # 标记要删除的点
+        to_remove = set()
+        for i, j in pairs:
+            to_remove.add(j)
+
+        # 返回未被标记删除的点
+        result = [points[i] for i in range(len(points)) if i not in to_remove]
+        return result
+
     def detect(self, image):
+        # 1. 预处理
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image
 
-        blur_k = self.params["blur"]
-        if blur_k % 2 == 0:
-            blur_k += 1
-        blur = cv2.GaussianBlur(gray, (blur_k, blur_k), 0)
+        # CLAHE 局部对比度增强，抵抗受压后亮度变化
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
 
-        block = self.params["block_size"]
-        if block % 2 == 0:
-            block += 1
-        thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, block, self.params["c_val"])
+        # 平滑滤波 — 限制最大blur防止密集点被合并
+        b_val = max(1, self.params.get("blur", 3))
+        if b_val % 2 == 0: b_val += 1
+        b_val = min(b_val, 7)
+        blur = cv2.GaussianBlur(gray, (b_val, b_val), 0)
 
-        if self.params["morph_size"] > 0:
-            kernel = np.ones((self.params["morph_size"], self.params["morph_size"]), np.uint8)
-            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        # 2. 局部极小值检测 (完全替代原本的轮廓检测)
+        points = self._detect_by_local_minima(gray, blur)
 
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_points = []
+        # 3. KDTree 去重
+        min_area = self.params["min_area"]
+        avg_radius = int(np.sqrt(min_area / np.pi))
+        dedup_radius = max(8, avg_radius * 2.5)  # 2.5倍半径作为去重距离
+        points = self._remove_duplicate_points(points, dedup_radius)
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.params["min_area"] or area > self.params.get("max_area", 5000):
-                continue
-            perimeter = cv2.arcLength(cnt, True)
-            circularity = (4 * np.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-            moments = cv2.moments(cnt)
-            ratio = 0
-            if moments['m00'] != 0:
-                mu20 = moments['mu20'] / moments['m00']
-                mu02 = moments['mu02'] / moments['m00']
-                mu11 = moments['mu11'] / moments['m00']
-                denominator = np.sqrt(4 * mu11 ** 2 + (mu20 - mu02) ** 2)
-                ratio = (mu20 + mu02 - denominator) / (mu20 + mu02 + denominator + 1e-2)
-
-            if circularity > (self.params["circularity"] / 100.0) and ratio > (self.params["inertia"] / 100.0):
-                (x, y), radius = cv2.minEnclosingCircle(cnt)
-                valid_points.append((int(x), int(y), int(radius)))
-
-        return valid_points
+        return points
 
 
 # ─────────────────────── 主窗口 ───────────────────────
@@ -259,6 +296,8 @@ class V7MainWindow(QMainWindow):
             'mirror_axis': None,
             'transform_origin': None,
             'transform_rotation': None,
+            'left_edges': None, 'right_edges': None,
+            'current_left_crossings': [], 'current_right_crossings': [],
         }
         self.drawing = {
             'left': {'mask': None},
@@ -270,6 +309,7 @@ class V7MainWindow(QMainWindow):
 
         # 匹配参数
         self.max_match_dist = 50
+        self.consecutive_abnormal_frames = 0
 
         # 3D 视角
         self.view_elev = 90
@@ -285,7 +325,7 @@ class V7MainWindow(QMainWindow):
         # 播放控制
         self.is_playing = False
         self.current_frame_idx = 0
-        self.fps = 30
+        self.fps = 60
 
         # 位移统计
         self.avg_displacement_vector = np.array([0.0, 0.0, 0.0])
@@ -382,7 +422,7 @@ class V7MainWindow(QMainWindow):
 
         self.spin_speed = QSpinBox()
         self.spin_speed.setRange(1, 120)
-        self.spin_speed.setValue(30)
+        self.spin_speed.setValue(60)
         self.spin_speed.setPrefix("速度: ")
         self.spin_speed.setSuffix(" fps")
         self.spin_speed.valueChanged.connect(self.update_playback_speed)
@@ -871,6 +911,10 @@ class V7MainWindow(QMainWindow):
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
 
+        # 提取基准帧Delaunay拓扑边
+        self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
+        self.FRAME_DATA['right_edges'] = self.extract_edges(pts2_R.astype(np.float64))
+
         return True
 
     # ──────────────────── 摄像头启动 ────────────────────
@@ -1162,13 +1206,11 @@ class V7MainWindow(QMainWindow):
             right_points_R[idx] = right_pts_det[det_j]
             found_diffs_l.append(left_points_R[idx] - pre_l[idx])
             found_diffs_r.append(right_points_R[idx] - pre_r[idx])
-
         if len(found_indices) > 0:
             found_diffs_l = np.array(found_diffs_l)
             found_diffs_r = np.array(found_diffs_r)
             found_pre_l = pre_l[found_indices]
             found_pre_r = pre_r[found_indices]
-
             for idx in lost_indices:
                 det_i, det_j = matched_pairs[idx]
                 if det_i == 100:
@@ -1180,7 +1222,6 @@ class V7MainWindow(QMainWindow):
                     left_points_R[idx] = pre_l[idx] + local_move_l
                 else:
                     left_points_R[idx] = left_pts_det[det_i]
-
                 if det_j == 100:
                     right_lost_mask[idx] = True
                     dists_r = np.linalg.norm(found_pre_r - pre_r[idx], axis=1)
@@ -1196,43 +1237,181 @@ class V7MainWindow(QMainWindow):
             left_lost_mask[:] = True
             right_lost_mask[:] = True
 
-        left_points_R = left_points_R.astype(np.float32)
-        right_points_R = right_points_R.astype(np.float32)
+        # ── 平面图约束 Mesh Untangling ──
+        left_edges = self.FRAME_DATA.get('left_edges') or []
+        right_edges = self.FRAME_DATA.get('right_edges') or []
 
-        K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
-        K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-        R, T = self.stereo_params['R'], self.stereo_params['T']
-        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                     flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
-        l_pts_ud = cv2.undistortPoints(left_points_R, K1, D1, R=R1, P=P1).squeeze()
-        r_pts_ud = cv2.undistortPoints(right_points_R, K2, D2, R=R2, P=P2).squeeze()
-        points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
+        def find_crossing_pairs(pts, edges):
+            crossings = []
+            n = len(edges)
+            if n == 0:
+                return crossings
+            bboxes = np.empty((n, 4), dtype=np.float64)
+            for i, (a, b) in enumerate(edges):
+                ax, ay = pts[a][0], pts[a][1]
+                bx, by = pts[b][0], pts[b][1]
+                bboxes[i, 0] = min(ax, bx)
+                bboxes[i, 1] = max(ax, bx)
+                bboxes[i, 2] = min(ay, by)
+                bboxes[i, 3] = max(ay, by)
+            for i in range(n):
+                a, b = edges[i]
+                p1, p2 = pts[a], pts[b]
+                for j in range(i + 1, n):
+                    c, d = edges[j]
+                    if a == c or a == d or b == c or b == d:
+                        continue
+                    if (bboxes[i, 1] < bboxes[j, 0] or bboxes[j, 1] < bboxes[i, 0] or
+                            bboxes[i, 3] < bboxes[j, 2] or bboxes[j, 3] < bboxes[i, 2]):
+                        continue
+                    if self.segments_intersect(p1, p2, pts[c], pts[d]):
+                        crossings.append((i, j))
+            return crossings
 
-        # 异常帧检测
-        base_3d = self.FRAME_DATA['base_3d_points']
-        is_abnormal = False
-        if base_3d is not None and len(points_3d) == len(base_3d):
-            z_diff = points_3d[:, 2] - base_3d[:, 2]
-            if np.any(z_diff > 1.0):
-                is_abnormal = True
-            if not is_abnormal and len(points_3d) >= 2:
-                from scipy.spatial.distance import pdist
-                distances = pdist(points_3d)
-                if np.any(distances < 0.3):
+        def untangle(pts_R, lost_mask, edges, matched_pairs_ref, side):
+            MAX_ITER = 5
+            for _ in range(MAX_ITER):
+                crossings = find_crossing_pairs(pts_R, edges)
+                if not crossings:
+                    break
+                resolved_any = False
+                for ei, ej in crossings:
+                    a, b = edges[ei]
+                    c, d = edges[ej]
+                    candidates = [(a, c), (a, d), (b, c), (b, d)]
+                    for p, q in candidates:
+                        p_lost = lost_mask[p]
+                        q_lost = lost_mask[q]
+                        if p_lost or q_lost:
+                            for lost_idx in ([p] if p_lost else []) + ([q] if q_lost else []):
+                                neighbors = []
+                                for ea, eb in edges:
+                                    if ea == lost_idx and not lost_mask[eb]:
+                                        neighbors.append(eb)
+                                    elif eb == lost_idx and not lost_mask[ea]:
+                                        neighbors.append(ea)
+                                if not neighbors:
+                                    continue
+                                crossing_nodes = set()
+                                for ci, cj in crossings:
+                                    for nd in edges[ci] + edges[cj]:
+                                        crossing_nodes.add(nd)
+                                safe_neighbors = [n for n in neighbors if n not in crossing_nodes]
+                                if not safe_neighbors:
+                                    continue
+                                base_pts = self.FRAME_DATA['left_points_0_R'] if side == 'left' \
+                                    else self.FRAME_DATA['right_points_0_R']
+                                moves = [pts_R[n] - base_pts[n] for n in safe_neighbors]
+                                median_move = np.median(moves, axis=0)
+                                safe_pos = base_pts[lost_idx] + median_move
+                                pts_R[lost_idx] = 0.5 * pts_R[lost_idx] + 0.5 * safe_pos
+                            resolved_any = True
+                            break
+                        pts_R_trial = pts_R.copy()
+                        pts_R_trial[p], pts_R_trial[q] = pts_R[q].copy(), pts_R[p].copy()
+                        new_crossings = find_crossing_pairs(pts_R_trial, edges)
+                        new_cross_set = set(map(tuple, new_crossings))
+                        old_cross_set = set(map(tuple, crossings))
+                        if (ei, ej) not in new_cross_set and len(new_cross_set) < len(old_cross_set):
+                            pts_R[p], pts_R[q] = pts_R_trial[p].copy(), pts_R_trial[q].copy()
+                            resolved_any = True
+                            break
+                    if resolved_any:
+                        break
+                if not resolved_any:
+                    break
+
+        # ── 灾难性熔断检测 ──
+        num_total = len(pre_l)
+        num_lost = int(np.sum(left_lost_mask) + np.sum(right_lost_mask))
+        lost_ratio = num_lost / (num_total * 2) if num_total > 0 else 1.0
+        left_initial_crossings = find_crossing_pairs(left_points_R, left_edges) if left_edges else []
+        right_initial_crossings = find_crossing_pairs(right_points_R, right_edges) if right_edges else []
+        is_catastrophic = (lost_ratio > 0.5 or
+                           len(left_initial_crossings) > 20 or
+                           len(right_initial_crossings) > 20)
+
+        if is_catastrophic:
+            self.FRAME_DATA['current_left_crossings'] = left_initial_crossings
+            self.FRAME_DATA['current_right_crossings'] = right_initial_crossings
+        else:
+            if left_edges:
+                untangle(left_points_R, left_lost_mask, left_edges, matched_pairs, 'left')
+            if right_edges:
+                untangle(right_points_R, right_lost_mask, right_edges, matched_pairs, 'right')
+            self.FRAME_DATA['current_left_crossings'] = (
+                find_crossing_pairs(left_points_R, left_edges) if left_edges else [])
+            self.FRAME_DATA['current_right_crossings'] = (
+                find_crossing_pairs(right_points_R, right_edges) if right_edges else [])
+
+        if not is_catastrophic:
+            left_points_R = left_points_R.astype(np.float32)
+            right_points_R = right_points_R.astype(np.float32)
+            K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
+            K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
+            R, T = self.stereo_params['R'], self.stereo_params['T']
+            R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
+                                                         flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+            l_pts_ud = cv2.undistortPoints(left_points_R, K1, D1, R=R1, P=P1).squeeze()
+            r_pts_ud = cv2.undistortPoints(right_points_R, K2, D2, R=R2, P=P2).squeeze()
+            points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
+
+            base_3d = self.FRAME_DATA['base_3d_points']
+            is_abnormal = False
+            abnormal_reason = []
+            if base_3d is not None and len(points_3d) == len(base_3d):
+                z_diff = points_3d[:, 2] - base_3d[:, 2]
+                if np.any(z_diff > 1.0):
                     is_abnormal = True
-            if is_abnormal:
-                self.FRAME_DATA['left_points_0_pre'] = self.FRAME_DATA['left_points_0_R'].copy()
-                self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
-                return (self.FRAME_DATA['base_3d_points'].copy(),
-                        self.FRAME_DATA['left_points_0_R'].copy(),
-                        self.FRAME_DATA['right_points_0_R'].copy(),
-                        np.zeros(len(base_3d), dtype=bool),
-                        np.zeros(len(base_3d), dtype=bool),
-                        True)
+                    abnormal_reason.append("Z轴深度异常")
+                if not is_abnormal and len(points_3d) >= 2:
+                    distances = pdist(points_3d)
+                    if np.any(distances < 0.3):
+                        is_abnormal = True
+                        abnormal_reason.append("点间距异常")
+        else:
+            is_abnormal = True
+            abnormal_reason = ["灾难性熔断"]
+            base_3d = self.FRAME_DATA['base_3d_points']
 
-        self.FRAME_DATA['left_points_0_pre'] = left_points_R
-        self.FRAME_DATA['right_points_0_pre'] = right_points_R
-        return points_3d, left_points_R, right_points_R, left_lost_mask, right_lost_mask, False
+        # ── 连续异常帧计数与分级处理 ──
+        if not is_abnormal:
+            self.consecutive_abnormal_frames = 0
+            self.FRAME_DATA['left_points_0_pre'] = left_points_R
+            self.FRAME_DATA['right_points_0_pre'] = right_points_R
+            return points_3d, left_points_R, right_points_R, left_lost_mask, right_lost_mask, False
+
+        self.consecutive_abnormal_frames += 1
+
+        if self.consecutive_abnormal_frames >= 5:
+            self.FRAME_DATA['left_points_0_pre'] = self.FRAME_DATA['left_points_0_R'].copy()
+            self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
+            self.consecutive_abnormal_frames = 0
+            n_pts = len(base_3d) if base_3d is not None else len(self.FRAME_DATA['left_points_0_R'])
+            return (self.FRAME_DATA['base_3d_points'].copy(),
+                    self.FRAME_DATA['left_points_0_R'].copy(),
+                    self.FRAME_DATA['right_points_0_R'].copy(),
+                    np.ones(n_pts, dtype=bool),
+                    np.ones(n_pts, dtype=bool),
+                    True)
+        else:
+            prev_left = self.FRAME_DATA['left_points_0_pre']
+            prev_right = self.FRAME_DATA['right_points_0_pre']
+            K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
+            K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
+            R, T = self.stereo_params['R'], self.stereo_params['T']
+            R1, R2, P1_prev, P2_prev, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
+                                                                    flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+            l_pts_ud_prev = cv2.undistortPoints(prev_left, K1, D1, R=R1, P=P1_prev).squeeze()
+            r_pts_ud_prev = cv2.undistortPoints(prev_right, K2, D2, R=R2, P=P2_prev).squeeze()
+            points_3d_prev = self.linear_triangulation(l_pts_ud_prev, r_pts_ud_prev, P1_prev, P2_prev)
+            n_pts = len(base_3d) if base_3d is not None else len(prev_left)
+            return (points_3d_prev,
+                    prev_left.copy(),
+                    prev_right.copy(),
+                    np.ones(n_pts, dtype=bool),
+                    np.ones(n_pts, dtype=bool),
+                    True)
 
     # ──────────────────── 工具函数 ────────────────────
 
@@ -1268,6 +1447,50 @@ class V7MainWindow(QMainWindow):
             X = X_homo[:3] / X_homo[3]
             points_3d[i] = X
         return points_3d
+
+    @staticmethod
+    def extract_edges(points_2d):
+        """从2D点集提取Delaunay三角剖分的去重边列表，并过滤幽灵长边。"""
+        if len(points_2d) < 3:
+            return []
+        pts = np.asarray(points_2d, dtype=np.float64)
+        try:
+            tri = Delaunay(pts)
+        except Exception:
+            return []
+        edges = set()
+        for simplex in tri.simplices:
+            a, b, c = int(simplex[0]), int(simplex[1]), int(simplex[2])
+            edges.add((min(a, b), max(a, b)))
+            edges.add((min(b, c), max(b, c)))
+            edges.add((min(a, c), max(a, c)))
+        edge_list = list(edges)
+        lengths = np.array([np.linalg.norm(pts[a] - pts[b]) for a, b in edge_list])
+        threshold = np.median(lengths) * 1.3
+        return [e for e, l in zip(edge_list, lengths) if l <= threshold]
+
+    @staticmethod
+    def segments_intersect(p1, p2, p3, p4):
+        """判断线段 p1p2 与线段 p3p4 是否真正相交。"""
+        if (max(p1[0], p2[0]) < min(p3[0], p4[0]) or
+                max(p3[0], p4[0]) < min(p1[0], p2[0]) or
+                max(p1[1], p2[1]) < min(p3[1], p4[1]) or
+                max(p3[1], p4[1]) < min(p1[1], p2[1])):
+            return False
+        eps = 3.0
+
+        def cross2d(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        d1 = cross2d(p3, p4, p1)
+        d2 = cross2d(p3, p4, p2)
+        d3 = cross2d(p1, p2, p3)
+        d4 = cross2d(p1, p2, p4)
+
+        if ((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps)) and \
+           ((d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)):
+            return True
+        return False
 
     def auto_match_points(self, left_points, right_points, left_pre, right_pre, max_dist=100):
         left_points = np.array(left_points)
@@ -1337,6 +1560,32 @@ class V7MainWindow(QMainWindow):
 
     def display_frame(self, frame, left_pts=None, right_pts=None, left_lost=None, right_lost=None):
         display_img = frame.copy()
+
+        # 绘制Delaunay拓扑网格连线
+        left_edges = self.FRAME_DATA.get('left_edges') or []
+        right_edges = self.FRAME_DATA.get('right_edges') or []
+        if left_pts is not None and left_edges:
+            crossing_left = set()
+            for ei, ej in self.FRAME_DATA.get('current_left_crossings', []):
+                crossing_left.add(ei)
+                crossing_left.add(ej)
+            for k, (a, b) in enumerate(left_edges):
+                pa = (int(left_pts[a][0]), int(left_pts[a][1]))
+                pb = (int(left_pts[b][0]), int(left_pts[b][1]))
+                color = (0, 0, 220) if k in crossing_left else (200, 180, 80)
+                cv2.line(display_img, pa, pb, color, 1, cv2.LINE_AA)
+        if right_pts is not None and right_edges:
+            crossing_right = set()
+            for ei, ej in self.FRAME_DATA.get('current_right_crossings', []):
+                crossing_right.add(ei)
+                crossing_right.add(ej)
+            for k, (a, b) in enumerate(right_edges):
+                pa = (int(right_pts[a][0]), int(right_pts[a][1]))
+                pb = (int(right_pts[b][0]), int(right_pts[b][1]))
+                color = (0, 0, 220) if k in crossing_right else (80, 200, 80)
+                cv2.line(display_img, pa, pb, color, 1, cv2.LINE_AA)
+
+        # 绘制标记点
         if left_pts is not None:
             for i, pt in enumerate(left_pts):
                 x, y = int(pt[0]), int(pt[1])
@@ -1504,6 +1753,7 @@ class V7MainWindow(QMainWindow):
         self.current_frame_idx = 0
         self.FRAME_DATA['left_points_0_pre'] = self.FRAME_DATA['left_points_0_R'].copy()
         self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
+        self.consecutive_abnormal_frames = 0
 
         # 重置scatter对象
         self._scatter_plot = None
@@ -1541,6 +1791,10 @@ class V7MainWindow(QMainWindow):
         points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
         self.FRAME_DATA['base_3d_points'] = points_3d
 
+        # 更新基准帧Delaunay拓扑边
+        self.FRAME_DATA['left_edges'] = self.extract_edges(left_pts.astype(np.float64))
+        self.FRAME_DATA['right_edges'] = self.extract_edges(right_pts.astype(np.float64))
+
         # 重新计算坐标变换矩阵（与新基准帧匹配）
         if len(points_3d) >= 3:
             origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
@@ -1564,6 +1818,7 @@ class V7MainWindow(QMainWindow):
         self.auto_zero_ft()
 
         self._updating_base = False
+        self.consecutive_abnormal_frames = 0
 
         self.status_bar.showMessage(f"已将当前帧设置为新的基准帧并调零力传感器（帧 {self.current_frame_idx}）")
 
