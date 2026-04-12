@@ -1257,6 +1257,10 @@ class VideoPointCloudPlayer(QMainWindow):
         y_axis /= np.linalg.norm(y_axis)
         x_axis = np.cross(y_axis, z_axis)
         x_axis /= np.linalg.norm(x_axis)
+        # 固定 X 轴大致朝向，防止特征向量符号不确定性导致 X-Y 平面 180° 翻转
+        if x_axis[0] < 0:
+            x_axis = -x_axis
+            y_axis = -y_axis
         rotation_matrix = np.vstack([x_axis, y_axis, z_axis]).T
         return centroid, rotation_matrix
 
