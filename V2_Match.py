@@ -18,7 +18,7 @@ from pathlib import Path
 from V0_ROI import draw_polygon_roi, apply_roi_mask, save_roi_masks, load_roi_masks, get_roi_file_path
 
 # --- 1. 标定参数与配置路径 ---
-CALIB_DIR = "./calibration_1mm_12X9_0227_Paras"
+CALIB_DIR = "./calibration_1mm_12X9_0416_Paras"
 CONFIG_FILE = "marker_params.json"  # 这里只保留文件名
 
 # 全局变量存储绘制状态

@@ -8,7 +8,7 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 # --- 配置部分 ---
-CAMERA_INDEX = 0 
+CAMERA_INDEX = 1 
 SAVE_DIR_LEFT = 'calibration_left'
 SAVE_DIR_RIGHT = 'calibration_right'
 

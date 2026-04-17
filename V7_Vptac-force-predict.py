@@ -42,7 +42,7 @@ from scipy.spatial.distance import cdist, pdist
 from scipy.spatial import Delaunay
 from scipy.optimize import linear_sum_assignment
 
-from V6_force_predict import ForcePredictor
+from V6_force_predict_lightnet import ForcePredictor
 
 # 中文字体配置
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
@@ -1044,7 +1044,7 @@ class V7MainWindow(QMainWindow):
     def get_local_coords(self, points_3d):
         if self.FRAME_DATA['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(points_3d)
-            points[:, 0] = -points[:, 0]
+            points[:, 1] = -points[:, 1]
             return points
         return points_3d.copy()
 
@@ -1632,10 +1632,10 @@ class V7MainWindow(QMainWindow):
 
         if self.FRAME_DATA['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(points_3d)
-            points[:, 0] = -points[:, 0]
+            points[:, 1] = -points[:, 1]
 
             base_local = self.transform_to_local_coordinates(self.FRAME_DATA['base_3d_points'])
-            base_local[:, 0] = -base_local[:, 0]
+            base_local[:, 1] = -base_local[:, 1]
 
             displacement_vectors = points - base_local
             deformation = np.linalg.norm(displacement_vectors, axis=1)
@@ -1683,6 +1683,7 @@ class V7MainWindow(QMainWindow):
         else:
             points = points_3d.copy()
             points[:, 0] = -points[:, 0]
+            points[:, 1] = -points[:, 1]
             if self._scatter_plot is None:
                 self.fig_3d.clear()
                 ax = self.fig_3d.add_subplot(111, projection='3d')
@@ -1966,7 +1967,11 @@ class V7MainWindow(QMainWindow):
 
     def update_h5_point_cloud(self, idx):
         """更新HDF5点云显示（带力箭头）"""
-        xyz = self.h5_vision_data['xyz'][idx]
+        xyz = self.h5_vision_data['xyz'][idx].copy()
+        # 绕Z轴旋转180°
+        xyz[:, 0] = -xyz[:, 0]
+        xyz[:, 1] = -xyz[:, 1]
+
         predicted_force = self.h5_vision_data['predicted_force'][idx]
 
         # 首次创建或需要重建

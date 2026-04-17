@@ -1,9 +1,9 @@
 {
   "input_mode": "camera",
   "video_path": null,
-  "calib_dir": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/calibration_1mm_12X9_0227_Paras",
-  "params_json_path": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/Vptac_shape_data_20260410_153104/marker_params.json",
-  "data_save_dir": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/Vptac_shape_data_20260410_153104/data",
-  "camera_index": 2,
+  "calib_dir": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/calibration_1mm_12X9_0416_Paras",
+  "params_json_path": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/Vptac_shape_data_20260416_145132/marker_params.json",
+  "data_save_dir": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/Vptac_shape_data_20260416_145132/data",
+  "camera_index": 1,
   "rotate_180": true
 }

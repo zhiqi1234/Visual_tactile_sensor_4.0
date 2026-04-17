@@ -87,7 +87,7 @@ class CameraThread(QThread):
 
     def run(self):
         # 打开默认摄像头 (索引0)
-        self.video_cap = cv2.VideoCapture(0)
+        self.video_cap = cv2.VideoCapture(1)
         
         # 尝试设置硬件参数
         self.video_cap.set(cv2.CAP_PROP_FPS, self.target_fps)

@@ -1786,11 +1786,11 @@ class VideoPointCloudPlayer(QMainWindow):
 
         if self.FRAME_DATA['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(points_3d)
-            points[:, 0] = -points[:, 0]  # 沿x=0平面镜像
+            points[:, 1] = -points[:, 1]  # 沿x=0平面镜像
 
             # 计算形变
             base_local = self.transform_to_local_coordinates(self.FRAME_DATA['base_3d_points'])
-            base_local[:, 0] = -base_local[:, 0]  # 沿x=0平面镜像
+            base_local[:, 1] = -base_local[:, 1]  # 沿x=0平面镜像
 
             # 计算位移向量
             displacement_vectors = points - base_local
@@ -1818,7 +1818,7 @@ class VideoPointCloudPlayer(QMainWindow):
                 ax.legend(loc='upper left', fontsize=8)
         else:
             points = points_3d.copy()
-            points[:, 0] = -points[:, 0]  # 沿x=0平面镜像
+            points[:, 1] = -points[:, 1]  # 沿x=0平面镜像
             ax.scatter(points[:, 0], points[:, 1], points[:, 2], c='b', s=50)
             # 重置位移统计
             self.reset_displacement_stats()

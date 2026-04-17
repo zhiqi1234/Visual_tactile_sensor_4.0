@@ -181,7 +181,7 @@ def plot_error_dist(y_true, y_pred, columns, save_dir):
 
 def plot_contact_analysis(dataset, test_idx, y_true, y_pred, save_dir):
     """分析平面vs尖锐物体的预测差异"""
-    contact_ratios = dataset.contact_ratios[test_idx]
+    contact_ratios = dataset.concentrations[test_idx]
     median_ratio = np.median(contact_ratios)
     is_flat = contact_ratios > median_ratio
 
