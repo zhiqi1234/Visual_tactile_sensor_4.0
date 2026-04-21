@@ -360,6 +360,9 @@ class VideoPointCloudPlayer(QMainWindow):
         self.chk_rotate = QCheckBox("旋转180°")
         self.chk_rotate.setChecked(True)
 
+        self.chk_show_avg_disp = QCheckBox("显示平均位移")
+        self.chk_show_avg_disp.setChecked(True)
+
         control_layout.addWidget(self.btn_select_input)
         control_layout.addWidget(self.btn_play_pause)
         control_layout.addWidget(self.btn_reset)
@@ -370,6 +373,7 @@ class VideoPointCloudPlayer(QMainWindow):
         control_layout.addWidget(self.lbl_camera)
         control_layout.addWidget(self.spin_camera_idx)
         control_layout.addWidget(self.chk_rotate)
+        control_layout.addWidget(self.chk_show_avg_disp)
         control_layout.addStretch()
 
         main_layout.addLayout(control_layout)
@@ -1337,7 +1341,7 @@ class VideoPointCloudPlayer(QMainWindow):
                             c=deformation, cmap='jet', s=50, vmin=0, vmax=1.5)
             cbar = self.fig_3d.colorbar(sc, ax=ax, shrink=0.8)
             cbar.set_label('Deformation (mm)', rotation=270, labelpad=15)
-            if self.avg_displacement_magnitude > 0.01:
+            if self.avg_displacement_magnitude > 0.01 and self.chk_show_avg_disp.isChecked():
                 center = np.mean(points, axis=0)
                 arrow_scale = 5.0
                 ax.quiver(center[0], center[1], center[2],

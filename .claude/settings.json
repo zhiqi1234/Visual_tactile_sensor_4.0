@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m py_compile V5_Vptac-force.py)"
+      "Bash(python -m py_compile V5_Vptac-force.py)",
+      "Bash(C:/Users/PC/AppData/Local/Programs/Python/Python310/python.exe -c ':*)"
     ]
   }
 }

@@ -490,8 +490,12 @@ class V7MainWindow(QMainWindow):
         self.btn_ft_auto_zero.clicked.connect(self.auto_zero_ft)
         self.btn_ft_reset_zero = QPushButton("重置调零")
         self.btn_ft_reset_zero.clicked.connect(self.reset_zero_ft)
+        self.chk_show_actual = QCheckBox("显示实际值")
+        self.chk_show_actual.setChecked(True)
+        self.chk_show_actual.stateChanged.connect(self.on_show_actual_changed)
         btn_layout.addWidget(self.btn_ft_auto_zero)
         btn_layout.addWidget(self.btn_ft_reset_zero)
+        btn_layout.addWidget(self.chk_show_actual)
         btn_layout.addStretch()
         force_layout.addLayout(btn_layout)
 
@@ -658,15 +662,32 @@ class V7MainWindow(QMainWindow):
             self._refresh_force_backgrounds(actual, pred)
 
         # ── blit 更新：只重绘线条 artist ──
+        show_actual = self.chk_show_actual.isChecked()
         for i, ax in enumerate(self.axes_force.flat):
             self.canvas_force.restore_region(self._force_backgrounds[i])
             self._force_lines_actual[i].set_ydata(self.force_actual_history[:, i])
             self._force_lines_pred[i].set_ydata(self.force_pred_history[:, i])
             self._force_vlines[i].set_xdata([self.force_history_idx, self.force_history_idx])
-            ax.draw_artist(self._force_lines_actual[i])
+            if show_actual:
+                ax.draw_artist(self._force_lines_actual[i])
             ax.draw_artist(self._force_lines_pred[i])
             ax.draw_artist(self._force_vlines[i])
             self.canvas_force.blit(ax.bbox)
+
+    def on_show_actual_changed(self, state):
+        """复选框状态变化时，切换实际力曲线的可见性并刷新背景"""
+        show_actual = self.chk_show_actual.isChecked()
+        # 实时模式
+        if hasattr(self, '_force_lines_actual'):
+            for line in self._force_lines_actual:
+                line.set_visible(show_actual)
+            # 重建背景（图例/可见性已变化）
+            self._force_plot_ready = False
+        # HDF5模式
+        if hasattr(self, '_h5_force_lines_actual'):
+            for line in self._h5_force_lines_actual:
+                line.set_visible(show_actual)
+            self.canvas_force.draw_idle()
 
     # ──────────────────── 力传感器调零 ────────────────────
 
@@ -1821,6 +1842,14 @@ class V7MainWindow(QMainWindow):
 
         # 自动调零力传感器
         self.auto_zero_ft()
+
+        # 重置力历史缓冲，使力曲线从零开始
+        self.force_actual_history = np.zeros((self.force_history_len, 6))
+        self.force_pred_history = np.zeros((self.force_history_len, 6))
+        self.force_history_idx = 0
+        self._force_plot_ready = False
+        if hasattr(self, '_force_title_counter'):
+            self._force_title_counter = 0
 
         self._updating_base = False
         self.consecutive_abnormal_frames = 0
