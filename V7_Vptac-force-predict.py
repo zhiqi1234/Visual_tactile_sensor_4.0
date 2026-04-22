@@ -559,6 +559,7 @@ class V7MainWindow(QMainWindow):
                     # 采集时保存调零后的数据
                     if self.is_recording:
                         zeroed = [raw[i] - self.ft_bias[i] for i in range(6)]
+                        zeroed[2] = -zeroed[2]  # Fz 取反
                         self.rec_force['timestamps'].append(timestamp)
                         self.rec_force['ft_values'].append(zeroed)
 
@@ -567,7 +568,14 @@ class V7MainWindow(QMainWindow):
         self._force_lines_actual = []
         self._force_lines_pred = []
         self._force_vlines = []
-        self._force_ylims = [(-1.0, 1.0)] * 6  # 每个子图的 y 范围
+        # 初始 y 轴范围：Fx(-5,5), Fy(-5,5), Fz(-10,0), Mx(-0.5,0.5), My(-0.5,0.5), Mz(-0.5,0.5)
+        init_ylims = [(-5.0, 5.0), (-5.0, 5.0), (0.0, 10.0),
+                      (-0.5, 0.5), (-0.5, 0.5), (-0.5, 0.5)]
+        # 始终保存初始范围，用于扩展时保底
+        self._force_init_ylims = list(init_ylims)
+        # 保留已扩展的 y 轴范围，不因重置而缩回
+        if not hasattr(self, '_force_ylims') or self._force_ylims is None:
+            self._force_ylims = list(init_ylims)
         labels = ['Fx', 'Fy', 'Fz', 'Mx', 'My', 'Mz']
         x = np.arange(self.force_history_len)
 
@@ -582,7 +590,7 @@ class V7MainWindow(QMainWindow):
             ax.legend(loc='upper right', fontsize=8)
             ax.grid(True, alpha=0.3)
             ax.set_xlim([0, self.force_history_len])
-            ax.set_ylim(-1.0, 1.0)
+            ax.set_ylim(init_ylims[i][0], init_ylims[i][1])
             self._force_lines_actual.append(line_actual)
             self._force_lines_pred.append(line_pred)
             self._force_vlines.append(vline)
@@ -619,10 +627,11 @@ class V7MainWindow(QMainWindow):
         actual = np.zeros(6)
         if ft_data and len(ft_data) > 0:
             ftv = ft_data[0]
-            actual = np.array([ftv.fx - bias[0], ftv.fy - bias[1], ftv.fz - bias[2],
+            actual = np.array([ftv.fx - bias[0], ftv.fy - bias[1], -(ftv.fz - bias[2]),
                               ftv.mx - bias[3], ftv.my - bias[4], ftv.mz - bias[5]])
 
-        pred = self.latest_predicted_force if self.latest_predicted_force is not None else np.zeros(6)
+        pred = self.latest_predicted_force.copy() if self.latest_predicted_force is not None else np.zeros(6)
+        pred[2] = -pred[2]  # Fz 取反
 
         # ── 写入环形缓冲 ──
         self.force_actual_history[self.force_history_idx] = actual
@@ -644,8 +653,9 @@ class V7MainWindow(QMainWindow):
             lo, hi = self._force_ylims[i]
             if data_min < lo or data_max > hi:
                 margin = max(abs(data_max - data_min) * 0.3, 0.5)
-                new_lo = data_min - margin
-                new_hi = data_max + margin
+                init_lo, init_hi = self._force_init_ylims[i]
+                new_lo = min(data_min - margin, init_lo)
+                new_hi = max(data_max + margin, init_hi)
                 self._force_ylims[i] = (new_lo, new_hi)
                 self.axes_force.flat[i].set_ylim(new_lo, new_hi)
                 needs_bg_refresh = True
@@ -1078,7 +1088,9 @@ class V7MainWindow(QMainWindow):
         self.rec_vision['abnormal'].append(is_abnormal)
         # 预测力：如果为None则填零
         if predicted_force is not None:
-            self.rec_vision['predicted_force'].append(predicted_force.astype(np.float32))
+            pf = predicted_force.astype(np.float32).copy()
+            pf[2] = -pf[2]  # Fz 取反
+            self.rec_vision['predicted_force'].append(pf)
         else:
             out_dim = self.force_predictor.config['output_dim'] if self.force_predictor else 6
             self.rec_vision['predicted_force'].append(np.zeros(out_dim, dtype=np.float32))
@@ -1847,6 +1859,7 @@ class V7MainWindow(QMainWindow):
         self.force_actual_history = np.zeros((self.force_history_len, 6))
         self.force_pred_history = np.zeros((self.force_history_len, 6))
         self.force_history_idx = 0
+        self._force_ylims = None  # 清空，让 _init_force_plot 恢复初始范围
         self._force_plot_ready = False
         if hasattr(self, '_force_title_counter'):
             self._force_title_counter = 0
