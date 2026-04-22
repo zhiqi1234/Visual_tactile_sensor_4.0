@@ -36,9 +36,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushBu
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
-import matplotlib.cm as _mpl_cm
-import pyqtgraph.opengl as gl
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.spatial import Delaunay, cKDTree
 from scipy.optimize import linear_sum_assignment
 
@@ -217,8 +217,8 @@ class CircleDetector:
 
         # 标记要删除的点
         to_remove = set()
-        for i in pairs:
-            to_remove.add(i)
+        for i, j in pairs:
+            to_remove.add(j)
 
         # 返回未被标记删除的点
         result = [points[i] for i in range(len(points)) if i not in to_remove]
@@ -316,7 +316,16 @@ class V7MainWindow(QMainWindow):
         self.max_match_dist = 50
         self.consecutive_abnormal_frames = 0
 
+        # 3D 视角
+        self.view_elev = 90
+        self.view_azim = 0
+        self.view_roll = -90
+        self.view_saved = False
+        self.is_dragging = False
         self._updating_base = False
+        self.drag_release_time = 0
+        self.drag_cooldown = 0.5
+        self._was_playing_before_drag = False
 
         # 播放控制
         self.is_playing = False
@@ -478,11 +487,12 @@ class V7MainWindow(QMainWindow):
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        self.gl_widget = gl.GLViewWidget()
-        self.gl_widget.setMinimumSize(400, 300)
-        self.gl_widget.setBackgroundColor((30, 30, 30))
-        self.gl_widget.setCameraPosition(distance=80, elevation=90, azimuth=90)
-        right_layout.addWidget(self.gl_widget)
+        self.fig_3d = plt.figure(figsize=(5, 4))
+        self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
+        self.canvas_3d = FigureCanvas(self.fig_3d)
+        self.toolbar_3d = NavigationToolbar(self.canvas_3d, self)
+        right_layout.addWidget(self.toolbar_3d)
+        right_layout.addWidget(self.canvas_3d)
         visual_splitter.addWidget(right_widget)
 
         visual_splitter.setSizes([700, 500])
@@ -521,6 +531,11 @@ class V7MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪 - 请选择输入源")
+
+        # 3D 视图鼠标事件
+        self.canvas_3d.mpl_connect('button_press_event', self.on_3d_mouse_press)
+        self.canvas_3d.mpl_connect('button_release_event', self.on_3d_mouse_release)
+        self.canvas_3d.mpl_connect('motion_notify_event', self.on_3d_mouse_motion)
 
         # 定时器：matplotlib 力曲线刷新 (blit模式，200ms = 5Hz)
         self.force_plot_timer = QTimer(self)
@@ -1018,6 +1033,10 @@ class V7MainWindow(QMainWindow):
             return
         self.pointcloud_frame_counter = 0
 
+        if self.is_dragging:
+            return
+        if time.time() - self.drag_release_time < self.drag_cooldown:
+            return
         current_time = time.time()
         if current_time - self.last_3d_update_time >= self.min_3d_update_interval:
             self.update_3d_view(points_3d)
@@ -1660,8 +1679,24 @@ class V7MainWindow(QMainWindow):
         self.lbl_video.setPixmap(scaled_pixmap)
 
     def update_3d_view(self, points_3d):
+        if self.is_dragging:
+            return
+        if time.time() - self.drag_release_time < self.drag_cooldown:
+            return
+        # 正在更新基准帧时跳过，避免竞争条件
         if getattr(self, '_updating_base', False):
             return
+
+        # 性能优化：只清除数据，不重建整个图
+        if not hasattr(self, '_scatter_plot'):
+            # 首次创建
+            self.fig_3d.clear()
+            ax = self.fig_3d.add_subplot(111, projection='3d')
+            self.ax_3d = ax
+            self._scatter_plot = None
+            self._colorbar = None
+        else:
+            ax = self.ax_3d
 
         if self.FRAME_DATA['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(points_3d)
@@ -1673,36 +1708,34 @@ class V7MainWindow(QMainWindow):
             displacement_vectors = points - base_local
             deformation = np.linalg.norm(displacement_vectors, axis=1)
 
-            # 统计（在缩放前计算，不影响数值）
+            # 统计
             self.avg_displacement_vector = np.mean(displacement_vectors, axis=0)
             self.avg_displacement_magnitude = np.mean(deformation)
             self.max_displacement = np.max(deformation)
             self.min_displacement = np.min(deformation)
 
-            # 范围扩大2倍（仅影响显示）
-            points *= 2
-
-            # 颜色映射 jet（深色背景下对比度好）
-            norm_def = np.clip(deformation / 1.5, 0, 1)
-            colors = _mpl_cm.jet(norm_def).astype(np.float32)
-
-            if not hasattr(self, '_gl_scatter') or self._gl_scatter is None:
-                self._gl_scatter = gl.GLScatterPlotItem(pos=points.astype(np.float32),
-                                                        color=colors, size=8, pxMode=True)
-                self.gl_widget.addItem(self._gl_scatter)
-                # 自适应相机：对准点云中心，距离 = 点云最大跨度的 2 倍
-                center = points.mean(axis=0)
-                span = max(np.ptp(points, axis=0).max(), 1.0)
-                self.gl_widget.opts['center'] = gl.QtGui.QVector3D(float(center[0]), float(center[1]), float(center[2]))
-                self.gl_widget.setCameraPosition(distance=span * 2, elevation=90, azimuth=90)
+            # 更新散点图而不是重建
+            if self._scatter_plot is None:
+                self.fig_3d.clear()
+                ax = self.fig_3d.add_subplot(111, projection='3d')
+                self.ax_3d = ax
+                self._scatter_plot = ax.scatter(points[:, 0], points[:, 1], points[:, 2],
+                                c=deformation, cmap='jet', s=50, vmin=0, vmax=1.5)
+                self._colorbar = self.fig_3d.colorbar(self._scatter_plot, ax=ax, shrink=0.8)
+                self._colorbar.set_label('Deformation (mm)', rotation=270, labelpad=15)
             else:
-                self._gl_scatter.setData(pos=points.astype(np.float32), color=colors)
+                self._scatter_plot._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
+                self._scatter_plot.set_array(deformation)
 
-            # 力箭头
-            if hasattr(self, '_gl_arrow') and self._gl_arrow is not None:
-                self.gl_widget.removeItem(self._gl_arrow)
-                self._gl_arrow = None
+            # 清除旧箭头
+            if hasattr(self, '_force_arrow_plot') and self._force_arrow_plot is not None:
+                try:
+                    self._force_arrow_plot.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self._force_arrow_plot = None
 
+            # 绘制预测力箭头
             if self.latest_predicted_force is not None:
                 pred_force = self.latest_predicted_force[:3]
                 force_mag = np.linalg.norm(pred_force)
@@ -1710,26 +1743,44 @@ class V7MainWindow(QMainWindow):
                     center = np.mean(points, axis=0)
                     force_dir = pred_force / force_mag
                     arrow_len = force_mag * 2.0
-                    tip = center + force_dir * arrow_len
-                    arrow_pts = np.array([center, tip], dtype=np.float32)
-                    self._gl_arrow = gl.GLLinePlotItem(pos=arrow_pts, color=(1, 0, 0, 1),
-                                                       width=3, antialias=True)
-                    self.gl_widget.addItem(self._gl_arrow)
+                    self._force_arrow_plot = ax.quiver(center[0], center[1], center[2],
+                                     force_dir[0] * arrow_len, force_dir[1] * arrow_len, force_dir[2] * arrow_len,
+                                     color='blue', arrow_length_ratio=0.2, linewidth=3,
+                                     label=f'预测力 ({force_mag:.2f}N)')
+                    ax.legend(loc='upper left', fontsize=8)
         else:
             points = points_3d.copy()
+            points[:, 0] = -points[:, 0]
             points[:, 1] = -points[:, 1]
-            points *= 2
-            blue = np.tile(np.array([0, 0, 1, 1], dtype=np.float32), (len(points), 1))
-            if not hasattr(self, '_gl_scatter') or self._gl_scatter is None:
-                self._gl_scatter = gl.GLScatterPlotItem(pos=points.astype(np.float32),
-                                                        color=blue, size=8, pxMode=True)
-                self.gl_widget.addItem(self._gl_scatter)
-                center = points.mean(axis=0)
-                span = max(np.ptp(points, axis=0).max(), 1.0)
-                self.gl_widget.opts['center'] = gl.QtGui.QVector3D(float(center[0]), float(center[1]), float(center[2]))
-                self.gl_widget.setCameraPosition(distance=span * 2, elevation=90, azimuth=90)
+            if self._scatter_plot is None:
+                self.fig_3d.clear()
+                ax = self.fig_3d.add_subplot(111, projection='3d')
+                self.ax_3d = ax
+                self._scatter_plot = ax.scatter(points[:, 0], points[:, 1], points[:, 2], c='b', s=50)
             else:
-                self._gl_scatter.setData(pos=points.astype(np.float32), color=blue)
+                self._scatter_plot._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
+
+        ax.set_xlabel('X (mm)')
+        ax.set_ylabel('Y (mm)')
+        ax.set_zlabel('Z (mm)')
+        ax.set_title(f'Frame {self.current_frame_idx}')
+
+        if len(points) > 0:
+            ax.set_box_aspect([np.ptp(points[:, 0]), np.ptp(points[:, 1]), np.ptp(points[:, 2])])
+
+        if self.view_saved:
+            try:
+                ax.view_init(elev=self.view_elev, azim=self.view_azim, roll=self.view_roll)
+            except TypeError:
+                ax.view_init(elev=self.view_elev, azim=self.view_azim)
+        else:
+            try:
+                ax.view_init(elev=90, azim=0, roll=-90)
+            except TypeError:
+                ax.view_init(elev=90, azim=0)
+
+        # 使用blit加速渲染
+        self.canvas_3d.draw_idle()
 
     # ──────────────────── 播放控制 ────────────────────
 
@@ -1777,13 +1828,10 @@ class V7MainWindow(QMainWindow):
         self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
         self.consecutive_abnormal_frames = 0
 
-        # 重置gl散点和箭头
-        if hasattr(self, '_gl_scatter') and self._gl_scatter is not None:
-            self.gl_widget.removeItem(self._gl_scatter)
-            self._gl_scatter = None
-        if hasattr(self, '_gl_arrow') and self._gl_arrow is not None:
-            self.gl_widget.removeItem(self._gl_arrow)
-            self._gl_arrow = None
+        # 重置scatter对象
+        self._scatter_plot = None
+        self._colorbar = None
+        self._force_arrow_plot = None
 
         self.update_3d_view(self.FRAME_DATA['base_3d_points'])
         self.status_bar.showMessage("已重置参考点")
@@ -1824,13 +1872,18 @@ class V7MainWindow(QMainWindow):
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
 
-        # 重置gl散点和箭头，因为基准帧改变了
-        if hasattr(self, '_gl_scatter') and self._gl_scatter is not None:
-            self.gl_widget.removeItem(self._gl_scatter)
-            self._gl_scatter = None
-        if hasattr(self, '_gl_arrow') and self._gl_arrow is not None:
-            self.gl_widget.removeItem(self._gl_arrow)
-            self._gl_arrow = None
+        # 重置scatter对象，因为基准帧改变了
+        self._scatter_plot = None
+        self._colorbar = None
+        if hasattr(self, '_force_arrow_plot') and self._force_arrow_plot is not None:
+            try:
+                self._force_arrow_plot.remove()
+            except (ValueError, AttributeError):
+                pass
+            self._force_arrow_plot = None
+        self.fig_3d.clear()
+        self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
+        self.canvas_3d.draw_idle()
 
         # 自动调零力传感器
         self.auto_zero_ft()
@@ -1850,6 +1903,36 @@ class V7MainWindow(QMainWindow):
         self.consecutive_abnormal_frames = 0
 
         self.status_bar.showMessage(f"已将当前帧设置为新的基准帧并调零力传感器（帧 {self.current_frame_idx}）")
+
+    # ──────────────────── 3D 视图鼠标事件 ────────────────────
+
+    def on_3d_mouse_press(self, event):
+        self.is_dragging = True
+        self._was_playing_before_drag = self.is_playing
+        if self.is_playing:
+            self.is_playing = False
+
+    def on_3d_mouse_motion(self, event):
+        if self.is_dragging and hasattr(self, 'ax_3d'):
+            self.view_elev = self.ax_3d.elev
+            self.view_azim = self.ax_3d.azim
+            self.view_roll = getattr(self.ax_3d, 'roll', 0)
+            self.view_saved = True
+
+    def on_3d_mouse_release(self, event):
+        if self.is_dragging:
+            self.is_dragging = False
+            self.drag_release_time = time.time()
+            if hasattr(self, 'ax_3d'):
+                self.view_elev = self.ax_3d.elev
+                self.view_azim = self.ax_3d.azim
+                self.view_roll = getattr(self.ax_3d, 'roll', 0)
+                self.view_saved = True
+            if self._was_playing_before_drag:
+                self.is_playing = True
+                self._was_playing_before_drag = False
+
+    # ──────────────────── 关闭 ────────────────────
 
     # ──────────────────── HDF5回放功能 ────────────────────
 
@@ -1884,18 +1967,15 @@ class V7MainWindow(QMainWindow):
             self.h5_mode = True
             self.h5_current_idx = 0
             # 重置绘图缓存
-            for attr in ('_gl_h5_ref', '_gl_h5_cur', '_gl_h5_arrow'):
-                item = getattr(self, attr, None)
-                if item is not None:
-                    self.gl_widget.removeItem(item)
-                if hasattr(self, attr):
-                    delattr(self, attr)
+            if hasattr(self, '_h5_scatter_ref'):
+                del self._h5_scatter_ref
             if hasattr(self, '_h5_force_lines_actual'):
                 del self._h5_force_lines_actual
             # 重置实时力曲线的 blit 状态
             if hasattr(self, '_force_lines_actual'):
                 del self._force_lines_actual
             self._force_plot_ready = False
+            self.ax_3d.clear()
             self.btn_play_pause.setEnabled(True)
             self.btn_play_pause.setText('播放')
             self.status_bar.showMessage(f'已加载HDF5: {os.path.basename(file_path)}')
@@ -1971,45 +2051,73 @@ class V7MainWindow(QMainWindow):
 
         predicted_force = self.h5_vision_data['predicted_force'][idx]
 
-        # 首次创建参考点云
-        if not hasattr(self, '_gl_h5_ref'):
-            self._gl_h5_ref = None
-            self._gl_h5_cur = None
-            self._gl_h5_arrow = None
+        # 首次创建或需要重建
+        if not hasattr(self, '_h5_scatter_ref'):
+            self.ax_3d.clear()
+            self._h5_scatter_ref = None
+            self._h5_scatter_cur = None
+            self._h5_force_quiver = None
 
             if self.h5_xyz_ref is not None and len(self.h5_xyz_ref) > 0:
-                ref_pts = self.h5_xyz_ref.astype(np.float32)
-                gray = np.tile(np.array([0.5, 0.5, 0.5, 0.3], dtype=np.float32), (len(ref_pts), 1))
-                self._gl_h5_ref = gl.GLScatterPlotItem(pos=ref_pts, color=gray, size=2, pxMode=True)
-                self.gl_widget.addItem(self._gl_h5_ref)
+                self._h5_scatter_ref = self.ax_3d.scatter(
+                    self.h5_xyz_ref[:, 0], self.h5_xyz_ref[:, 1], self.h5_xyz_ref[:, 2],
+                    c='gray', s=1, alpha=0.3, label='参考')
 
-        # 更新当前点云
-        if len(xyz) > 0:
-            blue = np.tile(np.array([0, 0, 1, 0.8], dtype=np.float32), (len(xyz), 1))
-            if self._gl_h5_cur is None:
-                self._gl_h5_cur = gl.GLScatterPlotItem(pos=xyz.astype(np.float32),
-                                                        color=blue, size=5, pxMode=True)
-                self.gl_widget.addItem(self._gl_h5_cur)
-            else:
-                self._gl_h5_cur.setData(pos=xyz.astype(np.float32), color=blue)
+            if len(xyz) > 0:
+                self._h5_scatter_cur = self.ax_3d.scatter(
+                    xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                    c='blue', s=10, alpha=0.8, label='当前')
 
-        # 移除旧力箭头
-        if self._gl_h5_arrow is not None:
-            self.gl_widget.removeItem(self._gl_h5_arrow)
-            self._gl_h5_arrow = None
+            self.ax_3d.set_xlabel('X')
+            self.ax_3d.set_ylabel('Y')
+            self.ax_3d.set_zlabel('Z')
+            self.ax_3d.legend()
+        else:
+            # 更新当前点云数据
+            if len(xyz) > 0:
+                if self._h5_scatter_cur is not None:
+                    self._h5_scatter_cur._offsets3d = (xyz[:, 0], xyz[:, 1], xyz[:, 2])
+                else:
+                    self._h5_scatter_cur = self.ax_3d.scatter(
+                        xyz[:, 0], xyz[:, 1], xyz[:, 2],
+                        c='blue', s=10, alpha=0.8, label='当前')
+
+            # 移除旧力箭头
+            if self._h5_force_quiver is not None:
+                self._h5_force_quiver.remove()
+                self._h5_force_quiver = None
 
         # 绘制力箭头
         if len(xyz) > 0:
             center = np.mean(xyz, axis=0)
             force_vec = predicted_force[:3]
             force_mag = np.linalg.norm(force_vec)
+
             if force_mag > 0.5:
                 force_dir = force_vec / force_mag
-                tip = center + force_dir * force_mag * 2.0
-                arrow_pts = np.array([center, tip], dtype=np.float32)
-                self._gl_h5_arrow = gl.GLLinePlotItem(pos=arrow_pts, color=(1, 0, 0, 1),
-                                                       width=3, antialias=True)
-                self.gl_widget.addItem(self._gl_h5_arrow)
+                arrow_len = force_mag * 2.0
+                self._h5_force_quiver = self.ax_3d.quiver(
+                    center[0], center[1], center[2],
+                    force_dir[0] * arrow_len, force_dir[1] * arrow_len, force_dir[2] * arrow_len,
+                    color='red', arrow_length_ratio=0.2, linewidth=3,
+                    label=f'预测力 ({force_mag:.2f}N)')
+
+        self.ax_3d.set_title(f'点云 + 预测力 (帧 {idx+1})')
+
+        # 设置坐标轴范围
+        if self.h5_xyz_ref is not None and len(self.h5_xyz_ref) > 0:
+            all_points = np.vstack([self.h5_xyz_ref, xyz]) if len(xyz) > 0 else self.h5_xyz_ref
+        elif len(xyz) > 0:
+            all_points = xyz
+        else:
+            all_points = np.array([[0, 0, 0]])
+
+        margin = 5
+        self.ax_3d.set_xlim([all_points[:, 0].min() - margin, all_points[:, 0].max() + margin])
+        self.ax_3d.set_ylim([all_points[:, 1].min() - margin, all_points[:, 1].max() + margin])
+        self.ax_3d.set_zlim([all_points[:, 2].min() - margin, all_points[:, 2].max() + margin])
+
+        self.canvas_3d.draw_idle()
 
     def closeEvent(self, event):
         if self.h5_file:
