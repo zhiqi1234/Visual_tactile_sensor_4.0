@@ -39,7 +39,7 @@ from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial import cKDTree, Delaunay
 from scipy.interpolate import Rbf
 from scipy.optimize import linear_sum_assignment
-from scipy.spatial.distance import cdist, pdist
+from scipy.spatial.distance import cdist
 
 
 class CameraThread(QThread):
@@ -325,6 +325,15 @@ class VideoPointCloudPlayer(QMainWindow):
         self.max_displacement = 0.0  # 最大位移
         self.min_displacement = 0.0  # 最小位移
         self.current_points_3d = None  # 当前帧3D点
+
+        # 图像缓冲（预分配，避免每帧 np.full 分配）
+        self._left_img_buf = None
+        self._right_img_buf = None
+        # KDTree 缓存（pre 数组不变时复用）
+        self._pre_l_tree = None
+        self._pre_l_tree_id = None
+        self._pre_r_tree = None
+        self._pre_r_tree_id = None
 
         # HDF5 数据采集
         self.is_recording = False
@@ -1394,10 +1403,15 @@ class VideoPointCloudPlayer(QMainWindow):
         mirror_axis = self.FRAME_DATA['mirror_axis']
 
         # 生成镜像视图
-        left_img = np.full((h, w, 3), 255, dtype=np.uint8)
-        left_img[:, :mirror_axis] = frame[:, :mirror_axis]
-        right_img = np.full((h, w, 3), 255, dtype=np.uint8)
-        right_img[:, mirror_axis:] = frame[:, mirror_axis:]
+        if self._left_img_buf is None or self._left_img_buf.shape != frame.shape:
+            self._left_img_buf = np.full((h, w, 3), 255, dtype=np.uint8)
+            self._right_img_buf = np.full((h, w, 3), 255, dtype=np.uint8)
+        self._left_img_buf[:] = 255
+        self._left_img_buf[:, :mirror_axis] = frame[:, :mirror_axis]
+        self._right_img_buf[:] = 255
+        self._right_img_buf[:, mirror_axis:] = frame[:, mirror_axis:]
+        left_img = self._left_img_buf
+        right_img = self._right_img_buf
 
         # 检测标记点
         left_pts_det_raw = np.array([(x, y) for (x, y, _) in
@@ -1412,17 +1426,22 @@ class VideoPointCloudPlayer(QMainWindow):
         pre_r = self.FRAME_DATA['right_points_0_pre']
         filter_dist = self.max_match_dist * 1.5
 
-        if len(left_pts_det_raw) > 0 and len(pre_l) > 0:
-            dist_matrix_l = cdist(left_pts_det_raw, pre_l)
-            min_dists_l = np.min(dist_matrix_l, axis=1)
+        if id(pre_l) != self._pre_l_tree_id:
+            self._pre_l_tree = cKDTree(pre_l) if len(pre_l) > 0 else None
+            self._pre_l_tree_id = id(pre_l)
+        if id(pre_r) != self._pre_r_tree_id:
+            self._pre_r_tree = cKDTree(pre_r) if len(pre_r) > 0 else None
+            self._pre_r_tree_id = id(pre_r)
+
+        if len(left_pts_det_raw) > 0 and self._pre_l_tree is not None:
+            min_dists_l, _ = self._pre_l_tree.query(left_pts_det_raw, k=1)
             valid_mask_l = min_dists_l <= filter_dist
             left_pts_det = left_pts_det_raw[valid_mask_l]
         else:
             left_pts_det = left_pts_det_raw
 
-        if len(right_pts_det_raw) > 0 and len(pre_r) > 0:
-            dist_matrix_r = cdist(right_pts_det_raw, pre_r)
-            min_dists_r = np.min(dist_matrix_r, axis=1)
+        if len(right_pts_det_raw) > 0 and self._pre_r_tree is not None:
+            min_dists_r, _ = self._pre_r_tree.query(right_pts_det_raw, k=1)
             valid_mask_r = min_dists_r <= filter_dist
             right_pts_det = right_pts_det_raw[valid_mask_r]
         else:
@@ -1585,8 +1604,7 @@ class VideoPointCloudPlayer(QMainWindow):
                 is_abnormal = True
 
             if not is_abnormal and len(points_3d) >= 2:
-                distances = pdist(points_3d)
-                if np.any(distances < 0.3):
+                if len(cKDTree(points_3d).query_pairs(0.3)) > 0:
                     is_abnormal = True
 
             if is_abnormal:
@@ -1843,7 +1861,7 @@ class VideoPointCloudPlayer(QMainWindow):
         rgb_image = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
         bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
 
         # 缩放以适应标签（使用快速缩放）
         label_size = self.lbl_video.size()

@@ -338,6 +338,15 @@ class V7MainWindow(QMainWindow):
         self.max_displacement = 0.0
         self.min_displacement = 0.0
 
+        # 图像缓冲（预分配，避免每帧 np.full 分配）
+        self._left_img_buf = None
+        self._right_img_buf = None
+        # KDTree 缓存（pre 数组不变时复用）
+        self._pre_l_tree = None
+        self._pre_l_tree_id = None
+        self._pre_r_tree = None
+        self._pre_r_tree_id = None
+
         # 力预测器
         self.force_predictor = None  # type: ForcePredictor | None
         self.latest_predicted_force = None  # (output_dim,) ndarray
@@ -368,6 +377,8 @@ class V7MainWindow(QMainWindow):
         self.force_actual_history = np.zeros((self.force_history_len, 6))
         self.force_pred_history = np.zeros((self.force_history_len, 6))
         self.force_history_idx = 0
+        self._force_data_min = np.zeros(6)
+        self._force_data_max = np.zeros(6)
 
         # ── 统一采集缓冲 ──
         self.is_recording = False
@@ -529,7 +540,7 @@ class V7MainWindow(QMainWindow):
         # 定时器：matplotlib 力曲线刷新 (blit模式，200ms = 5Hz)
         self.force_plot_timer = QTimer(self)
         self.force_plot_timer.timeout.connect(self.update_force_plot)
-        self.force_plot_timer.start(200)
+        self.force_plot_timer.start(333)
 
     # ──────────────────── 六维力传感器 ────────────────────
 
@@ -639,9 +650,13 @@ class V7MainWindow(QMainWindow):
         pred = self.latest_predicted_force.copy() if self.latest_predicted_force is not None else np.zeros(6)
         pred[2] = -pred[2]  # Fz 取反
 
-        # ── 写入环形缓冲 ──
+        # ── 写入环形缓冲，增量更新 min/max 缓存 ──
         self.force_actual_history[self.force_history_idx] = actual
         self.force_pred_history[self.force_history_idx] = pred
+        new_vals = np.minimum(actual, pred)
+        new_maxs = np.maximum(actual, pred)
+        np.minimum(self._force_data_min, new_vals, out=self._force_data_min)
+        np.maximum(self._force_data_max, new_maxs, out=self._force_data_max)
         self.force_history_idx = (self.force_history_idx + 1) % self.force_history_len
 
         # ── 首次初始化 ──
@@ -649,13 +664,11 @@ class V7MainWindow(QMainWindow):
             self._init_force_plot()
             return
 
-        # ── 检查 y 轴范围是否需要扩展 ──
+        # ── 检查 y 轴范围是否需要扩展（用增量缓存，不扫全量历史）──
         needs_bg_refresh = False
         for i in range(6):
-            a_col = self.force_actual_history[:, i]
-            p_col = self.force_pred_history[:, i]
-            data_min = min(a_col.min(), p_col.min())
-            data_max = max(a_col.max(), p_col.max())
+            data_min = self._force_data_min[i]
+            data_max = self._force_data_max[i]
             lo, hi = self._force_ylims[i]
             if data_min < lo or data_max > hi:
                 margin = max(abs(data_max - data_min) * 0.3, 0.5)
@@ -1188,10 +1201,15 @@ class V7MainWindow(QMainWindow):
         h, w = frame.shape[:2]
         mirror_axis = self.FRAME_DATA['mirror_axis']
 
-        left_img = np.full((h, w, 3), 255, dtype=np.uint8)
-        left_img[:, :mirror_axis] = frame[:, :mirror_axis]
-        right_img = np.full((h, w, 3), 255, dtype=np.uint8)
-        right_img[:, mirror_axis:] = frame[:, mirror_axis:]
+        if self._left_img_buf is None or self._left_img_buf.shape != frame.shape:
+            self._left_img_buf = np.full((h, w, 3), 255, dtype=np.uint8)
+            self._right_img_buf = np.full((h, w, 3), 255, dtype=np.uint8)
+        self._left_img_buf[:] = 255
+        self._left_img_buf[:, :mirror_axis] = frame[:, :mirror_axis]
+        self._right_img_buf[:] = 255
+        self._right_img_buf[:, mirror_axis:] = frame[:, mirror_axis:]
+        left_img = self._left_img_buf
+        right_img = self._right_img_buf
 
         left_pts_det_raw = np.array([(x, y) for (x, y, _) in
                                      self.apply_roi_mask(self.detector.detect(left_img),
@@ -1204,14 +1222,21 @@ class V7MainWindow(QMainWindow):
         pre_r = self.FRAME_DATA['right_points_0_pre']
         filter_dist = self.max_match_dist * 1.5
 
-        if len(left_pts_det_raw) > 0 and len(pre_l) > 0:
-            min_dists_l, _ = cKDTree(pre_l).query(left_pts_det_raw, k=1)
+        if id(pre_l) != self._pre_l_tree_id:
+            self._pre_l_tree = cKDTree(pre_l) if len(pre_l) > 0 else None
+            self._pre_l_tree_id = id(pre_l)
+        if id(pre_r) != self._pre_r_tree_id:
+            self._pre_r_tree = cKDTree(pre_r) if len(pre_r) > 0 else None
+            self._pre_r_tree_id = id(pre_r)
+
+        if len(left_pts_det_raw) > 0 and self._pre_l_tree is not None:
+            min_dists_l, _ = self._pre_l_tree.query(left_pts_det_raw, k=1)
             left_pts_det = left_pts_det_raw[min_dists_l <= filter_dist]
         else:
             left_pts_det = left_pts_det_raw
 
-        if len(right_pts_det_raw) > 0 and len(pre_r) > 0:
-            min_dists_r, _ = cKDTree(pre_r).query(right_pts_det_raw, k=1)
+        if len(right_pts_det_raw) > 0 and self._pre_r_tree is not None:
+            min_dists_r, _ = self._pre_r_tree.query(right_pts_det_raw, k=1)
             right_pts_det = right_pts_det_raw[min_dists_r <= filter_dist]
         else:
             right_pts_det = right_pts_det_raw
@@ -1867,6 +1892,8 @@ class V7MainWindow(QMainWindow):
         self.force_actual_history = np.zeros((self.force_history_len, 6))
         self.force_pred_history = np.zeros((self.force_history_len, 6))
         self.force_history_idx = 0
+        self._force_data_min = np.zeros(6)
+        self._force_data_max = np.zeros(6)
         self._force_ylims = None  # 清空，让 _init_force_plot 恢复初始范围
         self._force_plot_ready = False
         if hasattr(self, '_force_title_counter'):

@@ -305,6 +305,15 @@ class VideoPointCloudPlayer(QMainWindow):
         self.current_points_3d = None
         self.consecutive_abnormal_frames = 0  # 连续异常帧计数器（灾难性熔断与自动重置使用）
 
+        # 图像缓冲（预分配，避免每帧 np.full 分配）
+        self._left_img_buf = None
+        self._right_img_buf = None
+        # KDTree 缓存（pre 数组不变时复用）
+        self._pre_l_tree = None
+        self._pre_l_tree_id = None
+        self._pre_r_tree = None
+        self._pre_r_tree_id = None
+
         self.init_ui()
         QTimer.singleShot(100, self.auto_load_last_config)
 
@@ -841,10 +850,15 @@ class VideoPointCloudPlayer(QMainWindow):
             return None, None, None, None, None
         h, w = frame.shape[:2]
         mirror_axis = self.FRAME_DATA['mirror_axis']
-        left_img = np.full((h, w, 3), 255, dtype=np.uint8)
-        left_img[:, :mirror_axis] = frame[:, :mirror_axis]
-        right_img = np.full((h, w, 3), 255, dtype=np.uint8)
-        right_img[:, mirror_axis:] = frame[:, mirror_axis:]
+        if self._left_img_buf is None or self._left_img_buf.shape != frame.shape:
+            self._left_img_buf = np.full((h, w, 3), 255, dtype=np.uint8)
+            self._right_img_buf = np.full((h, w, 3), 255, dtype=np.uint8)
+        self._left_img_buf[:] = 255
+        self._left_img_buf[:, :mirror_axis] = frame[:, :mirror_axis]
+        self._right_img_buf[:] = 255
+        self._right_img_buf[:, mirror_axis:] = frame[:, mirror_axis:]
+        left_img = self._left_img_buf
+        right_img = self._right_img_buf
         left_pts_det_raw = np.array([(x, y) for (x, y, _) in
                                   self.apply_roi_mask(self.detector.detect(left_img),
                                                       self.drawing['left']['mask'])], dtype=np.float32)
@@ -854,16 +868,22 @@ class VideoPointCloudPlayer(QMainWindow):
         pre_l = self.FRAME_DATA['left_points_0_pre']
         pre_r = self.FRAME_DATA['right_points_0_pre']
         filter_dist = self.max_match_dist * 1.5
-        if len(left_pts_det_raw) > 0 and len(pre_l) > 0:
-            dist_matrix_l = cdist(left_pts_det_raw, pre_l)
-            min_dists_l = np.min(dist_matrix_l, axis=1)
+
+        if id(pre_l) != self._pre_l_tree_id:
+            self._pre_l_tree = cKDTree(pre_l) if len(pre_l) > 0 else None
+            self._pre_l_tree_id = id(pre_l)
+        if id(pre_r) != self._pre_r_tree_id:
+            self._pre_r_tree = cKDTree(pre_r) if len(pre_r) > 0 else None
+            self._pre_r_tree_id = id(pre_r)
+
+        if len(left_pts_det_raw) > 0 and self._pre_l_tree is not None:
+            min_dists_l, _ = self._pre_l_tree.query(left_pts_det_raw, k=1)
             valid_mask_l = min_dists_l <= filter_dist
             left_pts_det = left_pts_det_raw[valid_mask_l]
         else:
             left_pts_det = left_pts_det_raw
-        if len(right_pts_det_raw) > 0 and len(pre_r) > 0:
-            dist_matrix_r = cdist(right_pts_det_raw, pre_r)
-            min_dists_r = np.min(dist_matrix_r, axis=1)
+        if len(right_pts_det_raw) > 0 and self._pre_r_tree is not None:
+            min_dists_r, _ = self._pre_r_tree.query(right_pts_det_raw, k=1)
             valid_mask_r = min_dists_r <= filter_dist
             right_pts_det = right_pts_det_raw[valid_mask_r]
         else:
@@ -1071,12 +1091,9 @@ class VideoPointCloudPlayer(QMainWindow):
                     max_z_diff = np.max(np.abs(z_diff))
                     abnormal_reason.append(f"Z轴深度异常: 最大偏移 {max_z_diff:.3f}mm (阈值: 1.0mm)")
                 if not is_abnormal and len(points_3d) >= 2:
-                    from scipy.spatial.distance import pdist
-                    distances = pdist(points_3d)
-                    if np.any(distances < 0.3):
+                    if len(cKDTree(points_3d).query_pairs(0.3)) > 0:
                         is_abnormal = True
-                        min_dist = np.min(distances)
-                        abnormal_reason.append(f"点间距异常: 最小距离 {min_dist:.3f}mm (阈值: 0.3mm)")
+                        abnormal_reason.append(f"点间距异常: 存在距离小于0.3mm的点对")
         else:
             is_abnormal = True
             abnormal_reason = ["灾难性熔断"]
@@ -1313,7 +1330,7 @@ class VideoPointCloudPlayer(QMainWindow):
                 cv2.circle(display_img, (x, y), 4, color, -1)
         rgb_image = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
-        qt_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
+        qt_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888).copy()
         label_size = self.lbl_video.size()
         scaled_pixmap = QPixmap.fromImage(qt_image).scaled(label_size, Qt.KeepAspectRatio, Qt.FastTransformation)
         self.lbl_video.setPixmap(scaled_pixmap)
