@@ -17,6 +17,7 @@ V7_Vptac-force-predict — 点云实时显示 + 力预测 + 统一采集 + HDF5�
 import sys
 import signal
 import os
+from collections import deque
 _utils_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils")
 os.add_dll_directory(_utils_dir)
 sys.path.insert(0, _utils_dir)
@@ -38,8 +39,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-from scipy.spatial.distance import cdist, pdist
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, cKDTree
 from scipy.optimize import linear_sum_assignment
 
 from V6_force_predict_lightnet import ForcePredictor
@@ -97,7 +97,7 @@ class CameraThread(QThread):
 
 class FrameProcessThread(QThread):
     """帧处理线程 - 将耗时的检测和重建放到后台"""
-    result_signal = pyqtSignal(object, object, object, object, object, object, object, object)
+    result_signal = pyqtSignal(object, object, object, object, object, object, object, object, object)
 
     def __init__(self):
         super().__init__()
@@ -105,10 +105,14 @@ class FrameProcessThread(QThread):
         self.frame_queue = []
         self.lock = threading.Lock()
         self.process_func = None
+        self.render_func = None
         self.has_new_frame = threading.Event()
 
     def set_processor(self, process_func):
         self.process_func = process_func
+
+    def set_renderer(self, render_func):
+        self.render_func = render_func
 
     def add_frame(self, frame, timestamp=0.0):
         with self.lock:
@@ -130,8 +134,9 @@ class FrameProcessThread(QThread):
             if frame is not None and self.process_func is not None:
                 try:
                     points_3d, left_pts, right_pts, left_lost, right_lost, is_abnormal = self.process_func(frame)
-                    self.result_signal.emit(frame, points_3d, left_pts, right_pts,
-                                            left_lost, right_lost, timestamp, is_abnormal)
+                    qt_image = self.render_func(frame, left_pts, right_pts, left_lost, right_lost) if self.render_func else None
+                    self.result_signal.emit(qt_image, points_3d, left_pts, right_pts,
+                                            left_lost, right_lost, timestamp, is_abnormal, None)
                 except Exception:
                     pass
 
@@ -164,6 +169,7 @@ class CircleDetector:
         else:
             if verbose:
                 print("⚠ 未找到参数文件，使用系统默认参数")
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
     def _detect_by_local_minima(self, gray, blur):
         """局部极小值检测方法"""
@@ -226,8 +232,7 @@ class CircleDetector:
             gray = image
 
         # CLAHE 局部对比度增强，抵抗受压后亮度变化
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
+        gray = self._clahe.apply(gray)
 
         # 平滑滤波 — 限制最大blur防止密集点被合并
         b_val = max(1, self.params.get("blur", 3))
@@ -353,7 +358,10 @@ class V7MainWindow(QMainWindow):
         self.h5_playing = False
         self.latest_ft_timestamp = 0.0
         self.ft_bias = np.zeros(6, dtype=np.float64)  # 力传感器调零偏置
-        self.ft_recent_buffer = []  # 最近N个采样，用于自动调零
+        self.ft_recent_buffer = deque(maxlen=100)  # 最近N个采样，用于自动调零
+
+        # stereoRectify 缓存：参数不变时无需每帧重算
+        self._stereo_rectify_cache = {}  # key: (w, h) -> (R1, R2, P1, P2)
 
         # 力数据历史缓冲（用于坐标轴绘图）
         self.force_history_len = 300
@@ -554,8 +562,6 @@ class V7MainWindow(QMainWindow):
                 for ftv in parm.controller.ftvalues:
                     raw = [ftv.fx, ftv.fy, ftv.fz, ftv.mx, ftv.my, ftv.mz]
                     self.ft_recent_buffer.append(raw)
-                    if len(self.ft_recent_buffer) > 100:
-                        self.ft_recent_buffer.pop(0)
                     # 采集时保存调零后的数据
                     if self.is_recording:
                         zeroed = [raw[i] - self.ft_bias[i] for i in range(6)]
@@ -704,7 +710,7 @@ class V7MainWindow(QMainWindow):
     def auto_zero_ft(self):
         """自动调零：取最近50个采样的均值作为偏置"""
         with self.ft_lock:
-            buf = self.ft_recent_buffer.copy()
+            buf = list(self.ft_recent_buffer)
         if len(buf) == 0:
             QMessageBox.warning(self, "提示", "尚无力传感器数据，无法调零")
             return
@@ -919,10 +925,8 @@ class V7MainWindow(QMainWindow):
 
         K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
         K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-        R, T = self.stereo_params['R'], self.stereo_params['T']
         h, w = 480, 1280
-        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                     flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+        R1, R2, P1, P2 = self._get_stereo_rectify(w, h)
         pts1 = cv2.undistortPoints(pts1_R, K1, D1, R=R1, P=P1).squeeze()
         pts2 = cv2.undistortPoints(pts2_R, K2, D2, R=R2, P=P2).squeeze()
 
@@ -956,6 +960,7 @@ class V7MainWindow(QMainWindow):
 
         self.process_thread = FrameProcessThread()
         self.process_thread.set_processor(self.process_frame)
+        self.process_thread.set_renderer(self._render_to_qimage)
         self.process_thread.result_signal.connect(self.on_process_result)
         self.process_thread.start()
 
@@ -982,11 +987,7 @@ class V7MainWindow(QMainWindow):
 
         h, w = frame.shape[:2]
         if self.FRAME_DATA['mirror_axis'] is None or self.FRAME_DATA['mirror_axis'] != w // 2:
-            K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
-            K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-            R, T = self.stereo_params['R'], self.stereo_params['T']
-            R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                         flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+            R1, R2, P1, P2 = self._get_stereo_rectify(w, h)
             self.FRAME_DATA['P1'] = P1
             self.FRAME_DATA['P2'] = P2
 
@@ -998,8 +999,7 @@ class V7MainWindow(QMainWindow):
         else:
             self.display_frame(frame)
 
-    def on_process_result(self, frame, points_3d, left_pts, right_pts,
-                          left_lost, right_lost, timestamp=0.0, is_abnormal=False):
+    def on_process_result(self, qt_image, points_3d, _lp, _rp, _ll, _rl, timestamp=0.0, is_abnormal=False, _=None):
         if points_3d is None:
             return
 
@@ -1010,8 +1010,9 @@ class V7MainWindow(QMainWindow):
         # 采集缓冲
         self.buffer_frame_data(points_3d, timestamp, is_abnormal, predicted_force)
 
-        # 显示
-        self.display_frame(frame, left_pts, right_pts, left_lost, right_lost)
+        # 显示（QImage 已在子线程准备好）
+        if qt_image is not None:
+            self._set_video_pixmap(qt_image)
 
         # 点云更新优化：每N帧更新一次（降低刷新率到10Hz）
         self.pointcloud_frame_counter += 1
@@ -1204,15 +1205,13 @@ class V7MainWindow(QMainWindow):
         filter_dist = self.max_match_dist * 1.5
 
         if len(left_pts_det_raw) > 0 and len(pre_l) > 0:
-            dist_matrix_l = cdist(left_pts_det_raw, pre_l)
-            min_dists_l = np.min(dist_matrix_l, axis=1)
+            min_dists_l, _ = cKDTree(pre_l).query(left_pts_det_raw, k=1)
             left_pts_det = left_pts_det_raw[min_dists_l <= filter_dist]
         else:
             left_pts_det = left_pts_det_raw
 
         if len(right_pts_det_raw) > 0 and len(pre_r) > 0:
-            dist_matrix_r = cdist(right_pts_det_raw, pre_r)
-            min_dists_r = np.min(dist_matrix_r, axis=1)
+            min_dists_r, _ = cKDTree(pre_r).query(right_pts_det_raw, k=1)
             right_pts_det = right_pts_det_raw[min_dists_r <= filter_dist]
         else:
             right_pts_det = right_pts_det_raw
@@ -1382,9 +1381,7 @@ class V7MainWindow(QMainWindow):
             right_points_R = right_points_R.astype(np.float32)
             K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
             K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-            R, T = self.stereo_params['R'], self.stereo_params['T']
-            R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                         flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+            R1, R2, P1, P2 = self._get_stereo_rectify(w, h)
             l_pts_ud = cv2.undistortPoints(left_points_R, K1, D1, R=R1, P=P1).squeeze()
             r_pts_ud = cv2.undistortPoints(right_points_R, K2, D2, R=R2, P=P2).squeeze()
             points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
@@ -1398,8 +1395,8 @@ class V7MainWindow(QMainWindow):
                     is_abnormal = True
                     abnormal_reason.append("Z轴深度异常")
                 if not is_abnormal and len(points_3d) >= 2:
-                    distances = pdist(points_3d)
-                    if np.any(distances < 0.3):
+                    pairs = cKDTree(points_3d).query_pairs(0.3)
+                    if len(pairs) > 0:
                         is_abnormal = True
                         abnormal_reason.append("点间距异常")
         else:
@@ -1432,9 +1429,7 @@ class V7MainWindow(QMainWindow):
             prev_right = self.FRAME_DATA['right_points_0_pre']
             K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
             K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-            R, T = self.stereo_params['R'], self.stereo_params['T']
-            R1, R2, P1_prev, P2_prev, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                                    flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+            R1, R2, P1_prev, P2_prev = self._get_stereo_rectify(w, h)
             l_pts_ud_prev = cv2.undistortPoints(prev_left, K1, D1, R=R1, P=P1_prev).squeeze()
             r_pts_ud_prev = cv2.undistortPoints(prev_right, K2, D2, R=R2, P=P2_prev).squeeze()
             points_3d_prev = self.linear_triangulation(l_pts_ud_prev, r_pts_ud_prev, P1_prev, P2_prev)
@@ -1447,6 +1442,19 @@ class V7MainWindow(QMainWindow):
                     True)
 
     # ──────────────────── 工具函数 ────────────────────
+
+    def _get_stereo_rectify(self, w, h):
+        """缓存 stereoRectify 结果，相机参数不变时无需每帧重算"""
+        key = (w, h)
+        if key not in self._stereo_rectify_cache:
+            K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
+            K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
+            R, T = self.stereo_params['R'], self.stereo_params['T']
+            R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
+                K1, D1, K2, D2, (w, h), R, T,
+                flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+            self._stereo_rectify_cache[key] = (R1, R2, P1, P2)
+        return self._stereo_rectify_cache[key]
 
     def apply_roi_mask(self, points, mask):
         if mask is None:
@@ -1464,22 +1472,11 @@ class V7MainWindow(QMainWindow):
         return valid_points
 
     def linear_triangulation(self, pts1, pts2, P1, P2):
-        num_points = pts1.shape[0]
-        points_3d = np.zeros((num_points, 3))
-        for i in range(num_points):
-            x1, y1 = pts1[i]
-            x2, y2 = pts2[i]
-            A = np.array([
-                x1 * P1[2, :] - P1[0, :],
-                y1 * P1[2, :] - P1[1, :],
-                x2 * P2[2, :] - P2[0, :],
-                y2 * P2[2, :] - P2[1, :]
-            ])
-            _, _, V = np.linalg.svd(A)
-            X_homo = V[-1, :]
-            X = X_homo[:3] / X_homo[3]
-            points_3d[i] = X
-        return points_3d
+        pts1_h = pts1.T.reshape(2, -1).astype(np.float64)
+        pts2_h = pts2.T.reshape(2, -1).astype(np.float64)
+        pts4d = cv2.triangulatePoints(P1, P2, pts1_h, pts2_h)
+        pts4d /= pts4d[3]
+        return pts4d[:3].T
 
     @staticmethod
     def extract_edges(points_2d):
@@ -1535,7 +1532,11 @@ class V7MainWindow(QMainWindow):
         def get_global_hungarian_match(ref_pts, det_pts, threshold):
             if len(ref_pts) == 0 or len(det_pts) == 0:
                 return {}
-            dist_matrix = cdist(ref_pts, det_pts)
+            pre_dists, _ = cKDTree(ref_pts).query(det_pts, k=1)
+            det_pts = det_pts[pre_dists <= threshold]
+            if len(det_pts) == 0:
+                return {}
+            dist_matrix = np.linalg.norm(ref_pts[:, None] - det_pts[None], axis=2)
             large_value = threshold * 10
             cost_matrix = dist_matrix.copy()
             cost_matrix[cost_matrix > threshold] = large_value
@@ -1595,7 +1596,8 @@ class V7MainWindow(QMainWindow):
 
     # ──────────────────── 显示 ────────────────────
 
-    def display_frame(self, frame, left_pts=None, right_pts=None, left_lost=None, right_lost=None):
+    def _render_to_qimage(self, frame, left_pts=None, right_pts=None, left_lost=None, right_lost=None):
+        """在子线程中完成绘图和格式转换，返回 QImage（已 .copy() 防止内存释放）"""
         display_img = frame.copy()
 
         # 绘制Delaunay拓扑网格连线
@@ -1636,8 +1638,16 @@ class V7MainWindow(QMainWindow):
 
         rgb_image = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        qt_image = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        return qt_image
+
+    def display_frame(self, frame, left_pts=None, right_pts=None, left_lost=None, right_lost=None):
+        """主线程调用：若传入 frame 则先渲染，再贴图（用于未播放时的直通显示）"""
+        qt_image = self._render_to_qimage(frame, left_pts, right_pts, left_lost, right_lost)
+        self._set_video_pixmap(qt_image)
+
+    def _set_video_pixmap(self, qt_image):
+        """主线程：将 QImage 缩放后贴到视频标签"""
         label_size = self.lbl_video.size()
         scaled_pixmap = QPixmap.fromImage(qt_image).scaled(
             label_size, Qt.KeepAspectRatio, Qt.FastTransformation)
@@ -1819,11 +1829,9 @@ class V7MainWindow(QMainWindow):
 
         K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
         K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-        R, T = self.stereo_params['R'], self.stereo_params['T']
         w = self.FRAME_DATA['mirror_axis'] * 2
         h = self.FRAME_DATA.get('frame_height', 480)
-        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                     flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
+        R1, R2, P1, P2 = self._get_stereo_rectify(w, h)
         l_pts_ud = cv2.undistortPoints(left_pts, K1, D1, R=R1, P=P1).squeeze()
         r_pts_ud = cv2.undistortPoints(right_pts, K2, D2, R=R2, P=P2).squeeze()
         points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
