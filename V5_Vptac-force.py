@@ -1192,9 +1192,12 @@ class VideoPointCloudPlayer(QMainWindow):
         """重置到首帧"""
         self.current_frame_idx = 0
 
-        # 重置参考点
         self.FRAME_DATA['left_points_0_pre'] = self.FRAME_DATA['left_points_0_R'].copy()
         self.FRAME_DATA['right_points_0_pre'] = self.FRAME_DATA['right_points_0_R'].copy()
+
+        self._scatter_plot = None
+        self._colorbar = None
+        self._quiver_plot = None
 
         if self.input_mode == 'video':
             self.slider_progress.setValue(0)
@@ -1242,8 +1245,13 @@ class VideoPointCloudPlayer(QMainWindow):
 
         self.FRAME_DATA['base_3d_points'] = points_3d
 
-        # 注意：不重新构建坐标系，保持原始坐标系不变
-        # 这样可以确保坐标系始终一致，只更新基准3D点用于计算形变
+        # 重置 scatter 对象，基准帧变化后需要重建
+        self._scatter_plot = None
+        self._colorbar = None
+        self._quiver_plot = None
+        self.fig_3d.clear()
+        self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
+        self.canvas_3d.draw_idle()
 
         # 更新3D视图
         self.update_3d_view(points_3d)
@@ -1642,23 +1650,11 @@ class VideoPointCloudPlayer(QMainWindow):
         return valid_points
 
     def linear_triangulation(self, pts1, pts2, P1, P2):
-        """线性三角化"""
-        num_points = pts1.shape[0]
-        points_3d = np.zeros((num_points, 3))
-        for i in range(num_points):
-            x1, y1 = pts1[i]
-            x2, y2 = pts2[i]
-            A = np.array([
-                x1 * P1[2, :] - P1[0, :],
-                y1 * P1[2, :] - P1[1, :],
-                x2 * P2[2, :] - P2[0, :],
-                y2 * P2[2, :] - P2[1, :]
-            ])
-            _, _, V = np.linalg.svd(A)
-            X_homo = V[-1, :]
-            X = X_homo[:3] / X_homo[3]
-            points_3d[i] = X
-        return points_3d
+        pts1_h = pts1.T.reshape(2, -1).astype(np.float64)
+        pts2_h = pts2.T.reshape(2, -1).astype(np.float64)
+        pts4d = cv2.triangulatePoints(P1, P2, pts1_h, pts2_h)
+        pts4d /= pts4d[3]
+        return pts4d[:3].T
 
     @staticmethod
     def extract_edges(points_2d):
@@ -1875,52 +1871,74 @@ class VideoPointCloudPlayer(QMainWindow):
 
     def update_3d_view(self, points_3d):
         """更新3D视图"""
-        # 拖拽中或拖拽刚结束时不更新
         if self.is_dragging:
             return
         if time.time() - self.drag_release_time < self.drag_cooldown:
             return
 
-        self.fig_3d.clear()
-        ax = self.fig_3d.add_subplot(111, projection='3d')
+        if not hasattr(self, '_scatter_plot'):
+            self._scatter_plot = None
+            self._colorbar = None
+            self._quiver_plot = None
 
         if self.FRAME_DATA['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(points_3d)
-            points[:, 1] = -points[:, 1]  # 沿x=0平面镜像
+            points[:, 1] = -points[:, 1]
 
-            # 计算形变
             base_local = self.transform_to_local_coordinates(self.FRAME_DATA['base_3d_points'])
-            base_local[:, 1] = -base_local[:, 1]  # 沿x=0平面镜像
+            base_local[:, 1] = -base_local[:, 1]
 
-            # 计算位移向量
             displacement_vectors = points - base_local
             deformation = np.linalg.norm(displacement_vectors, axis=1)
 
-            # 计算位移统计
             self.calculate_displacement_stats(displacement_vectors, deformation)
             self.current_points_3d = points
 
-            sc = ax.scatter(points[:, 0], points[:, 1], points[:, 2],
-                            c=deformation, cmap='jet', s=50, vmin=0, vmax=1.5)
-            cbar = self.fig_3d.colorbar(sc, ax=ax, shrink=0.8)
-            cbar.set_label('Deformation (mm)', rotation=270, labelpad=15)
+            if self._scatter_plot is None:
+                self.fig_3d.clear()
+                ax = self.fig_3d.add_subplot(111, projection='3d')
+                self.ax_3d = ax
+                self._scatter_plot = ax.scatter(points[:, 0], points[:, 1], points[:, 2],
+                                                c=deformation, cmap='jet', s=50, vmin=0, vmax=1.5)
+                self._colorbar = self.fig_3d.colorbar(self._scatter_plot, ax=ax, shrink=0.8)
+                self._colorbar.set_label('Deformation (mm)', rotation=270, labelpad=15)
+                self._quiver_plot = None
+            else:
+                ax = self.ax_3d
+                self._scatter_plot._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
+                self._scatter_plot.set_array(deformation)
 
-            # 绘制平均位移箭头
+            if self._quiver_plot is not None:
+                try:
+                    self._quiver_plot.remove()
+                except (ValueError, AttributeError):
+                    pass
+                self._quiver_plot = None
+
             if self.avg_displacement_magnitude > 0.01:
                 center = np.mean(points, axis=0)
-                arrow_scale = 5.0  # 箭头缩放因子
-                ax.quiver(center[0], center[1], center[2],
-                         self.avg_displacement_vector[0] * arrow_scale,
-                         self.avg_displacement_vector[1] * arrow_scale,
-                         self.avg_displacement_vector[2] * arrow_scale,
-                         color='red', arrow_length_ratio=0.3, linewidth=2.5,
-                         label=f'Avg: {self.avg_displacement_magnitude:.3f}mm')
+                arrow_scale = 5.0
+                self._quiver_plot = ax.quiver(
+                    center[0], center[1], center[2],
+                    self.avg_displacement_vector[0] * arrow_scale,
+                    self.avg_displacement_vector[1] * arrow_scale,
+                    self.avg_displacement_vector[2] * arrow_scale,
+                    color='red', arrow_length_ratio=0.3, linewidth=2.5,
+                    label=f'Avg: {self.avg_displacement_magnitude:.3f}mm')
                 ax.legend(loc='upper left', fontsize=8)
         else:
             points = points_3d.copy()
-            points[:, 1] = -points[:, 1]  # 沿x=0平面镜像
-            ax.scatter(points[:, 0], points[:, 1], points[:, 2], c='b', s=50)
-            # 重置位移统计
+            points[:, 1] = -points[:, 1]
+
+            if self._scatter_plot is None:
+                self.fig_3d.clear()
+                ax = self.fig_3d.add_subplot(111, projection='3d')
+                self.ax_3d = ax
+                self._scatter_plot = ax.scatter(points[:, 0], points[:, 1], points[:, 2], c='b', s=50)
+            else:
+                ax = self.ax_3d
+                self._scatter_plot._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
+
             self.reset_displacement_stats()
 
         ax.set_xlabel('X (mm)')
@@ -1928,16 +1946,13 @@ class VideoPointCloudPlayer(QMainWindow):
         ax.set_zlabel('Z (mm)')
         ax.set_title(f'Frame {self.current_frame_idx}')
 
-        # 设置坐标轴比例
         if len(points) > 0:
             ax.set_box_aspect([np.ptp(points[:, 0]), np.ptp(points[:, 1]), np.ptp(points[:, 2])])
 
-        # 设置视角
         if self.view_saved:
             try:
                 ax.view_init(elev=self.view_elev, azim=self.view_azim, roll=self.view_roll)
             except TypeError:
-                # 旧版本matplotlib不支持roll参数
                 ax.view_init(elev=self.view_elev, azim=self.view_azim)
         else:
             try:
@@ -1945,8 +1960,7 @@ class VideoPointCloudPlayer(QMainWindow):
             except TypeError:
                 ax.view_init(elev=90, azim=0)
 
-        self.ax_3d = ax
-        self.canvas_3d.draw()
+        self.canvas_3d.draw_idle()
 
     def calculate_displacement_stats(self, displacement_vectors, deformation):
         """计算位移统计并更新UI显示"""
