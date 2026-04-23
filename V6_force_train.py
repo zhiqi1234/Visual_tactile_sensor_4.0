@@ -31,9 +31,10 @@ class ForceDataset(Dataset):
         self.X = []  # dxyz 展平 + 接触特征
         self.y = []  # force
         self.file_info = []  # 记录每个样本来源及其在总数组中的起止索引
+        self.segment_info = []  # 记录每个segment的起止索引: [(start_idx, end_idx, file_idx), ...]
         self.contact_threshold = contact_threshold
 
-        for fpath in h5_files:
+        for file_idx, fpath in enumerate(h5_files):
             with h5py.File(fpath, 'r') as f:
                 if 'vision/dxyz' not in f or 'force/values' not in f:
                     print(f"[跳过] {fpath}: 缺少 vision/dxyz 或 force/values")
@@ -44,6 +45,35 @@ class ForceDataset(Dataset):
                 T = min(dxyz.shape[0], force.shape[0])
                 dxyz = dxyz[:T]
                 force = force[:T, :force_dims]
+
+                # 读取segments信息
+                segments = []
+                if 'segments' in f:
+                    sg = f['segments']
+                    count = int(sg.attrs.get('count', 0))
+                    for i in range(count):
+                        s = float(sg.attrs.get(f'seg_{i}_start', 0))
+                        e = float(sg.attrs.get(f'seg_{i}_end', 0))
+                        segments.append((s, e))
+                    print(f"[加载] {os.path.basename(fpath)}: 找到 {count} 个有效段")
+
+                # 读取时间戳（使用force/timestamp作为基准，因为segment是相对于它的）
+                timestamps = None
+                if 'force/timestamp' in f:
+                    timestamps = f['force/timestamp'][:]
+                elif 'vision/timestamp' in f:
+                    timestamps = f['vision/timestamp'][:]
+                elif 'vision/timestamps' in f:
+                    timestamps = f['vision/timestamps'][:]
+                elif 'timestamps' in f:
+                    timestamps = f['timestamps'][:]
+
+                if timestamps is None:
+                    print(f"  [警告] 未找到timestamps，无法进行segment映射")
+                else:
+                    print(f"  timestamps范围: {timestamps.min():.3f}s ~ {timestamps.max():.3f}s")
+                    # segment时间是相对于timestamps[0]的
+                    t_rel = timestamps - timestamps[0]
 
                 # 提取接触特征
                 contact_features = self._extract_contact_features(dxyz)  # (T, 7)
@@ -57,6 +87,20 @@ class ForceDataset(Dataset):
                 self.X.append(x_combined)
                 self.y.append(y_flat)
                 self.file_info.append((os.path.basename(fpath), T, offset))
+
+                # 记录每个segment对应的帧索引范围
+                if segments and timestamps is not None:
+                    for seg_idx, (seg_start_time, seg_end_time) in enumerate(segments):
+                        # 找到时间戳在segment范围内的帧（使用相对时间）
+                        mask = (t_rel >= seg_start_time) & (t_rel <= seg_end_time)
+                        indices = np.where(mask)[0]
+                        if len(indices) > 0:
+                            start_idx = offset + indices[0]
+                            end_idx = offset + indices[-1] + 1
+                            self.segment_info.append((start_idx, end_idx, file_idx))
+                        else:
+                            print(f"  [警告] Segment {seg_idx} ({seg_start_time:.3f}~{seg_end_time:.3f}s) 未找到匹配帧")
+
                 print(f"[加载] {os.path.basename(fpath)}: {T} 帧, "
                       f"dxyz shape={dxyz.shape}, force shape={force.shape}")
 
@@ -75,6 +119,7 @@ class ForceDataset(Dataset):
         print(f"\n总样本数: {len(self.X)}")
         print(f"输入维度: {self.X.shape[1]}, 输出维度: {self.y.shape[1]}")
         print(f"力范围: {self.y.min(axis=0)} ~ {self.y.max(axis=0)}")
+        print(f"总segment数: {len(self.segment_info)}")
 
     def _extract_contact_features(self, dxyz):
         """提取接触面积相关特征
@@ -125,6 +170,64 @@ class ForceDataset(Dataset):
             features[t, 8] = -np.sum(disp_prob * np.log(disp_prob + 1e-8))
 
         return features
+
+    def get_segment_based_split(self, train_ratio=0.8, group_size=10, min_frames_for_split=100):
+        """基于segment划分训练集和验证集
+
+        Args:
+            train_ratio: 训练集比例（默认0.8，即每10个segment前8个训练）
+            group_size: 分组大小（默认10）
+            min_frames_for_split: 单segment内部划分的最小帧数阈值（默认100）
+
+        Returns:
+            train_indices: 训练集索引列表
+            val_indices: 验证集索引列表
+        """
+        if len(self.segment_info) == 0:
+            print("[警告] 未找到segment信息，使用随机划分")
+            total = len(self.X)
+            indices = np.arange(total)
+            np.random.shuffle(indices)
+            split = int(total * train_ratio)
+            return indices[:split].tolist(), indices[split:].tolist()
+
+        train_indices = []
+        val_indices = []
+
+        # 按group_size分组处理segments
+        num_segments = len(self.segment_info)
+        train_per_group = int(group_size * train_ratio)
+
+        for group_start in range(0, num_segments, group_size):
+            group_end = min(group_start + group_size, num_segments)
+            group_segments = self.segment_info[group_start:group_end]
+
+            # 当前组的训练/验证分界点
+            train_end_in_group = min(train_per_group, len(group_segments))
+
+            for i, (start_idx, end_idx, file_idx) in enumerate(group_segments):
+                seg_frames = end_idx - start_idx
+
+                # 特殊处理：如果整个组只有1个segment且帧数足够，内部划分
+                if len(group_segments) == 1 and seg_frames >= min_frames_for_split:
+                    split_point = start_idx + int(seg_frames * train_ratio)
+                    train_indices.extend(range(start_idx, split_point))
+                    val_indices.extend(range(split_point, end_idx))
+                    print(f"  [单segment内部划分] Segment {group_start}: "
+                          f"训练={split_point-start_idx}帧, 验证={end_idx-split_point}帧")
+                else:
+                    # 正常按segment整体划分
+                    indices = list(range(start_idx, end_idx))
+                    if i < train_end_in_group:
+                        train_indices.extend(indices)
+                    else:
+                        val_indices.extend(indices)
+
+        print(f"\n[Segment划分] 总segment数: {num_segments}")
+        print(f"  训练集: {len(train_indices)} 帧 ({len(train_indices)/len(self.X)*100:.1f}%)")
+        print(f"  验证集: {len(val_indices)} 帧 ({len(val_indices)/len(self.X)*100:.1f}%)")
+
+        return train_indices, val_indices
 
     def compute_scaler(self, indices=None):
         """根据指定索引（通常为训练集）计算标准化参数并设置"""
@@ -229,41 +332,63 @@ class ForceMLP(nn.Module):
 
 # ─────────────────────── 训练逻辑 ───────────────────────
 
-def select_files_interactive():
-    """弹出 Windows 原生文件选择对话框，选择训练/验证文件和测试文件。
+def select_files_by_number(data_dir):
+    """扫描目录下的processed文件，让用户通过编号选择
 
     Returns:
         train_val_files: 用于训练+验证的文件列表
-        test_files: 用于测试的文件列表（整段）
-        data_dir: 数据所在目录（从第一个文件推断）
+        test_files: 用于测试的文件列表
+        data_dir: 数据所在目录
     """
-    from tkinter import Tk, filedialog
-    root = Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
+    # 扫描文件
+    h5_files = sorted(glob.glob(os.path.join(data_dir, "processed_*.h5")))
 
-    train_val_files = list(filedialog.askopenfilenames(
-        title="选择 训练+验证 文件",
-        initialdir=os.path.dirname(os.path.abspath(__file__)),
-        filetypes=[("HDF5 文件", "*.h5"), ("所有文件", "*.*")],
-    ))
+    if not h5_files:
+        print(f"在 {data_dir} 中未找到 processed_*.h5 文件")
+        return [], [], data_dir
 
-    if not train_val_files:
-        root.destroy()
-        return [], [], None
+    # 显示文件列表
+    print("\n" + "="*60)
+    print(f"在 {data_dir} 中找到以下文件:")
+    for i, f in enumerate(h5_files):
+        print(f"  [{i}] {os.path.basename(f)}")
+    print("="*60)
 
-    data_dir = os.path.dirname(train_val_files[0])
+    # 获取用户输入
+    while True:
+        try:
+            train_val_input = input("\n请输入训练+验证文件的编号 (例如: 0-4 或 0,1,2,3,4): ").strip()
+            if not train_val_input:
+                print("输入不能为空")
+                continue
 
-    test_files = list(filedialog.askopenfilenames(
-        title="选择 测试 文件",
-        initialdir=data_dir,
-        filetypes=[("HDF5 文件", "*.h5"), ("所有文件", "*.*")],
-    ))
+            # 解析输入
+            train_val_indices = parse_indices(train_val_input, len(h5_files))
+            if train_val_indices is None:
+                continue
 
-    root.destroy()
+            test_input = input("请输入测试文件的编号 (例如: 5 或 5,6，留空表示无测试集): ").strip()
+            if test_input:
+                test_indices = parse_indices(test_input, len(h5_files))
+                if test_indices is None:
+                    continue
+            else:
+                test_indices = []
 
-    print(f"\n数据目录: {data_dir}")
-    print(f"训练+验证文件 ({len(train_val_files)}):")
+            # 检查是否有重复
+            if set(train_val_indices) & set(test_indices):
+                print("错误: 训练和测试文件不能重复")
+                continue
+
+            break
+        except KeyboardInterrupt:
+            print("\n用户取消")
+            return [], [], data_dir
+
+    train_val_files = [h5_files[i] for i in train_val_indices]
+    test_files = [h5_files[i] for i in test_indices]
+
+    print(f"\n训练+验证文件 ({len(train_val_files)}):")
     for f in train_val_files:
         print(f"  {os.path.basename(f)}")
     print(f"测试文件 ({len(test_files)}):")
@@ -271,6 +396,46 @@ def select_files_interactive():
         print(f"  {os.path.basename(f)}")
 
     return train_val_files, test_files, data_dir
+
+
+def parse_indices(input_str, max_index):
+    """解析用户输入的索引字符串
+
+    支持格式:
+    - 单个数字: "5"
+    - 逗号分隔: "0,1,2,3"
+    - 范围: "0-4"
+    - 混合: "0-2,5,7-9"
+
+    Returns:
+        list of int or None if invalid
+    """
+    indices = []
+    parts = input_str.split(',')
+
+    try:
+        for part in parts:
+            part = part.strip()
+            if '-' in part:
+                # 范围
+                start, end = part.split('-')
+                start, end = int(start.strip()), int(end.strip())
+                if start < 0 or end >= max_index or start > end:
+                    print(f"错误: 范围 {part} 无效 (有效范围: 0-{max_index-1})")
+                    return None
+                indices.extend(range(start, end + 1))
+            else:
+                # 单个数字
+                idx = int(part)
+                if idx < 0 or idx >= max_index:
+                    print(f"错误: 索引 {idx} 超出范围 (有效范围: 0-{max_index-1})")
+                    return None
+                indices.append(idx)
+
+        return sorted(set(indices))  # 去重并排序
+    except ValueError:
+        print(f"错误: 输入格式无效，请使用数字、逗号或连字符")
+        return None
 
 
 def split_by_contiguous(dataset, train_val_fnames, test_fnames, val_ratio=0.15):
@@ -317,7 +482,9 @@ def train(args):
         test_files = []
         print(f"[非交互模式] 所有 {len(h5_files)} 个文件用于训练+验证")
     else:
-        train_val_files, test_files, data_dir = select_files_interactive()
+        # 使用编号选择方式
+        data_dir = args.data_dir
+        train_val_files, test_files, data_dir = select_files_by_number(data_dir)
 
     if not train_val_files:
         print("未选择任何训练文件，退出")
@@ -331,10 +498,17 @@ def train(args):
     dataset = ForceDataset(all_files, force_dims=args.force_dims)
 
     # ── 划分数据（先划分，再算 scaler，杜绝泄漏） ──
-    train_val_fnames = set(os.path.basename(f) for f in train_val_files)
-    test_fnames = set(os.path.basename(f) for f in test_files)
-    train_idx, val_idx, test_idx = split_by_contiguous(
-        dataset, train_val_fnames, test_fnames)
+    # 使用基于segment的划分方式
+    train_idx, val_idx = dataset.get_segment_based_split(train_ratio=0.8, group_size=10)
+
+    # 处理测试集
+    test_idx = []
+    if test_files:
+        test_fnames = set(os.path.basename(f) for f in test_files)
+        for fname, n_frames, offset in dataset.file_info:
+            if fname in test_fnames:
+                test_idx.extend(range(offset, offset + n_frames))
+                print(f"  {fname}: test={n_frames} (整段)")
 
     # ── 只在训练集上计算标准化参数 ──
     dataset.compute_scaler(train_idx)
