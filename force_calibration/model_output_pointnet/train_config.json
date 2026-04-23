@@ -1,0 +1,29 @@
+{
+  "model_type": "PointNet",
+  "output_dim": 6,
+  "use_input_transform": true,
+  "use_feature_transform": true,
+  "lr": 0.001,
+  "batch_size": 32,
+  "epochs_trained": 136,
+  "best_val_loss": 0.09422367065879515,
+  "device": "cuda",
+  "augment": true,
+  "noise_std": 0.01,
+  "rotation_std": 0.1,
+  "reg_weight": 0.001,
+  "train_val_files": [
+    "processed_calibration_20260423_150139.h5",
+    "processed_calibration_20260423_151429.h5",
+    "processed_calibration_20260423_152206.h5",
+    "processed_calibration_20260423_152805.h5"
+  ],
+  "test_files": [
+    "processed_calibration_20260423_153140.h5"
+  ],
+  "total_samples": 23030,
+  "train_samples": 20223,
+  "val_samples": 2807,
+  "test_samples": 3841,
+  "timestamp": "20260423_173007"
+}

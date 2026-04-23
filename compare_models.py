@@ -5,9 +5,9 @@ import matplotlib.patches as mpatches
 
 # 加载三个模型的metrics
 models = {
-    "BaseNet": "force_calibration_2/model_output/evaluation/metrics.json",
-    "LightNet": "force_calibration_2/model_output_lightnet/evaluation/metrics.json",
-    "PointNet": "force_calibration_2/model_output_pointnet/evaluation/metrics.json",
+    "BaseNet": "force_calibration/model_output/evaluation/metrics.json",
+    "LightNet": "force_calibration/model_output_lightnet/evaluation/metrics.json",
+    "PointNet": "force_calibration/model_output_pointnet/evaluation/metrics.json",
 }
 
 data = {}

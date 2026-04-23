@@ -751,7 +751,7 @@ def main():
                         help="使用特征变换网络")
     parser.add_argument('--lr', type=float, default=1e-3, help="学习率")
     parser.add_argument('--weight_decay', type=float, default=1e-4, help="权重衰减")
-    parser.add_argument('--batch_size', type=int, default=32, help="批大小")
+    parser.add_argument('--batch_size', type=int, default=256, help="批大小")
     parser.add_argument('--epochs', type=int, default=500, help="最大训练轮数")
     parser.add_argument('--patience', type=int, default=30, help="Early stopping 耐心值")
     parser.add_argument('--augment', action='store_true', default=True,
