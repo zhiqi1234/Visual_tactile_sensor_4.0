@@ -37,6 +37,7 @@ class HDF5Viewer(QMainWindow):
         self._dragging_segment = None
         self._seg_artists = []  # [(span_f, span_m, vline_s_f, vline_s_m, vline_e_f, vline_e_m), ...]
         self._force_axes = None  # (ax_f, ax_m) 缓存
+        self._force_plot_cached = False  # 力觉图表是否已缓存
 
         # 源文件路径
         self._source_pc_path = ""
@@ -542,6 +543,7 @@ class HDF5Viewer(QMainWindow):
             lines.append(f"  {col}: min={v.min():.4f}  max={v.max():.4f}  mean={v.mean():.4f}")
         self.txt_info.append("\n".join(lines))
         self.statusBar().showMessage(f"已加载力觉文件: {os.path.basename(filepath)} | 采样数: {len(ft_ts)}")
+        self._force_plot_cached = False
         self.plot_force_data()
 
     def load_file(self, filepath):
@@ -793,6 +795,7 @@ class HDF5Viewer(QMainWindow):
 
     def _show_all_force(self):
         self._force_view_all = True
+        self._force_plot_cached = False
         self.plot_force_data(self.spin_frame.value())
 
     # ──────────────────────────────────────────────
@@ -809,20 +812,27 @@ class HDF5Viewer(QMainWindow):
             self.canvas_force.draw()
             self.fig_force3d.clear()
             self.canvas_force3d.draw()
+            self._force_plot_cached = False
             return
 
+        # 首次加载或数据变化时完整绘制，之后只更新帧标记
+        if not self._force_plot_cached:
+            self._plot_force_data_full(frame_idx)
+            self._force_plot_cached = True
+        else:
+            self._update_force_frame_marker(frame_idx)
+
+    def _plot_force_data_full(self, frame_idx=None):
+        """完整绘制力觉图表（数据线、有效段等）"""
         ft_ts = self.ft_data['timestamp']
         ft_vals = self.ft_data['values'].copy()
         columns = self.ft_data['columns']
-        # 应用力偏差
         n_ch = min(6, ft_vals.shape[1])
         ft_vals[:, :n_ch] -= self.force_bias[:n_ch]
         t_rel = ft_ts - ft_ts[0]
         t_total = t_rel[-1]
 
-        # 更新滚动条范围
         self._update_scroll_range()
-
         self.fig_force.clear()
         ax_f = self.fig_force.add_subplot(211)
         ax_m = self.fig_force.add_subplot(212, sharex=ax_f)
@@ -861,7 +871,6 @@ class HDF5Viewer(QMainWindow):
         ax_m.legend(loc='upper right', fontsize=7, ncol=3)
         ax_m.grid(True, alpha=0.3)
 
-        # 绘制有效段（并缓存 artist 用于拖拽时快速更新）
         self._seg_artists = []
         self._force_axes = (ax_f, ax_m)
         sel_row = self.list_segments.currentRow()
@@ -877,24 +886,7 @@ class HDF5Viewer(QMainWindow):
             vl_e_m = ax_m.axvline(e, color=color, linewidth=1.5, linestyle='-', alpha=0.6)
             self._seg_artists.append((span_f, span_m, vl_s_f, vl_s_m, vl_e_f, vl_e_m))
 
-        # 当前帧力觉值（用于3D显示和标题）
-        cur_force_vals = None
-
-        # 绘制当前帧竖线（含时间偏移）
-        if frame_idx is not None and 'timestamp' in self.h5_data:
-            vision_ts = self.h5_data['timestamp']
-            cur_abs = vision_ts[frame_idx] + self.time_offset
-            cur_ft_rel = cur_abs - ft_ts[0]
-            for ax in [ax_f, ax_m]:
-                ax.axvline(cur_ft_rel, color='#333333', linewidth=1.2,
-                           linestyle='--', alpha=0.8)
-            if ft_ts[0] <= cur_abs <= ft_ts[-1]:
-                idx = min(np.searchsorted(ft_ts, cur_abs), len(ft_ts) - 1)
-                cur_force_vals = ft_vals[idx]
-                val_str = '  '.join(f'{columns[j]}={cur_force_vals[j]:.2f}' for j in range(min(6, len(columns))))
-                ax_f.set_title(f't={cur_ft_rel:.3f}s  |  {val_str}', fontsize=9)
-
-        # 绘制异常帧标记（红色竖线）
+        # 绘制异常帧标记
         if 'abnormal' in self.h5_data and 'timestamp' in self.h5_data:
             abnormal = self.h5_data['abnormal']
             vision_ts = self.h5_data['timestamp']
@@ -909,15 +901,6 @@ class HDF5Viewer(QMainWindow):
                              linestyle=':', alpha=0.7, label=f'异常帧 ({len(abnormal_indices)})')
                 ax_f.legend(loc='upper right', fontsize=7, ncol=4)
 
-        # 应用时间窗口（滚动）
-        if not self._force_view_all:
-            window = self.spin_window.value()
-            if window < t_total:
-                t_start = self.scroll_force.value() / 10.0
-                t_end = t_start + window
-                ax_f.set_xlim(t_start, t_end)
-                # ax_m 共享 x 轴，自动跟随
-
         # 防止数据全为零时 Y 轴范围过小
         for ax, min_half in [(ax_f, 5.0), (ax_m, 0.5)]:
             ylo, yhi = ax.get_ylim()
@@ -925,12 +908,62 @@ class HDF5Viewer(QMainWindow):
                 mid = (ylo + yhi) / 2
                 ax.set_ylim(mid - min_half, mid + min_half)
 
-        # 用固定比例布局替代 tight_layout，避免数据接近零时子图被压扁
         self.fig_force.subplots_adjust(
             left=0.06, right=0.92, top=0.92, bottom=0.12, hspace=0.25)
         self.canvas_force.draw()
 
-        # ── 3D 力向量可视化 ──
+        self._update_force_frame_marker(frame_idx)
+
+    def _update_force_frame_marker(self, frame_idx=None):
+        """只更新当前帧标记和3D显示，不重新绘制数据线"""
+        if not self.ft_data or self._force_axes is None:
+            return
+
+        ft_ts = self.ft_data['timestamp']
+        ft_vals = self.ft_data['values'].copy()
+        columns = self.ft_data['columns']
+        n_ch = min(6, ft_vals.shape[1])
+        ft_vals[:, :n_ch] -= self.force_bias[:n_ch]
+        t_rel = ft_ts - ft_ts[0]
+        t_total = t_rel[-1]
+
+        ax_f, ax_m = self._force_axes
+        cur_force_vals = None
+
+        # 清除旧的帧标记线（只清除当前帧线，不清除整个图表）
+        for line in ax_f.get_lines()[-10:]:  # 只检查最后几条线
+            if hasattr(line, '_label') and line._label is None:
+                if line.get_linestyle() == '--':
+                    line.remove()
+        for line in ax_m.get_lines()[-10:]:
+            if hasattr(line, '_label') and line._label is None:
+                if line.get_linestyle() == '--':
+                    line.remove()
+
+        # 绘制当前帧竖线
+        if frame_idx is not None and 'timestamp' in self.h5_data:
+            vision_ts = self.h5_data['timestamp']
+            cur_abs = vision_ts[frame_idx] + self.time_offset
+            cur_ft_rel = cur_abs - ft_ts[0]
+            ax_f.axvline(cur_ft_rel, color='#333333', linewidth=1.2,
+                        linestyle='--', alpha=0.8)
+            ax_m.axvline(cur_ft_rel, color='#333333', linewidth=1.2,
+                        linestyle='--', alpha=0.8)
+            if ft_ts[0] <= cur_abs <= ft_ts[-1]:
+                idx = min(np.searchsorted(ft_ts, cur_abs), len(ft_ts) - 1)
+                cur_force_vals = ft_vals[idx]
+                val_str = '  '.join(f'{columns[j]}={cur_force_vals[j]:.2f}' for j in range(min(6, len(columns))))
+                ax_f.set_title(f't={cur_ft_rel:.3f}s  |  {val_str}', fontsize=9)
+
+        # 应用时间窗口
+        if not self._force_view_all:
+            window = self.spin_window.value()
+            if window < t_total:
+                t_start = self.scroll_force.value() / 10.0
+                t_end = t_start + window
+                ax_f.set_xlim(t_start, t_end)
+
+        self.canvas_force.draw()
         self._plot_force_3d(cur_force_vals, columns)
 
     # ──────────────────────────────────────────────
@@ -1145,6 +1178,7 @@ class HDF5Viewer(QMainWindow):
 
         self.segments = filtered
         self._refresh_segment_list()
+        self._force_plot_cached = False
         self.plot_force_data(self.spin_frame.value())
 
         msg = f"检测到 {len(detected)} 个片段"
@@ -1174,6 +1208,7 @@ class HDF5Viewer(QMainWindow):
         self.segments.append([start, end])
         self._refresh_segment_list()
         self.list_segments.setCurrentRow(len(self.segments) - 1)
+        self._force_plot_cached = False
         self.plot_force_data(self.spin_frame.value())
 
     def _del_segment(self):
@@ -1181,6 +1216,7 @@ class HDF5Viewer(QMainWindow):
         if 0 <= row < len(self.segments):
             self.segments.pop(row)
             self._refresh_segment_list()
+            self._force_plot_cached = False
             self.plot_force_data(self.spin_frame.value())
 
     def _refresh_segment_list(self):
@@ -1189,6 +1225,7 @@ class HDF5Viewer(QMainWindow):
             self.list_segments.addItem(f"段 {i+1}: {s:.3f}s ~ {e:.3f}s")
 
     def _on_segment_selected(self, row):
+        self._force_plot_cached = False
         self.plot_force_data(self.spin_frame.value())
 
     # ── 鼠标拖拽有效段边界 ──
@@ -1220,6 +1257,7 @@ class HDF5Viewer(QMainWindow):
             for i, (s, e) in enumerate(self.segments):
                 if s <= x <= e:
                     self.list_segments.setCurrentRow(i)
+                    self._force_plot_cached = False
                     self.plot_force_data(self.spin_frame.value())
                     break
 
@@ -1234,7 +1272,9 @@ class HDF5Viewer(QMainWindow):
         else:
             seg[1] = max(x, seg[0] + 0.01)
         self._refresh_segment_list()
+        self.list_segments.blockSignals(True)
         self.list_segments.setCurrentRow(idx)
+        self.list_segments.blockSignals(False)
         # 快速更新：仅移动当前段的 artist，不重绘整个图
         if idx < len(self._seg_artists) and self._force_axes is not None:
             s, e = seg
@@ -1258,7 +1298,7 @@ class HDF5Viewer(QMainWindow):
     def _on_force_release(self, event):
         if self._dragging_segment is not None:
             self._dragging_segment = None
-            # 拖拽结束后做一次完整重绘，确保显示准确
+            self._force_plot_cached = False
             self.plot_force_data(self.spin_frame.value())
 
     # ──────────────────────────────────────────────
@@ -1267,6 +1307,7 @@ class HDF5Viewer(QMainWindow):
     def _on_bias_changed(self, _=None):
         for i, spin in enumerate(self.bias_spins):
             self.force_bias[i] = spin.value()
+        self._force_plot_cached = False
         self.plot_force_data(self.spin_frame.value())
 
     def _auto_zero_bias(self):
@@ -1276,7 +1317,6 @@ class HDF5Viewer(QMainWindow):
         vals = self.ft_data['values']
         n = min(50, len(vals))
         mean_vals = vals[:n].mean(axis=0)
-        # 阻止信号触发多次重绘
         for spin in self.bias_spins:
             spin.blockSignals(True)
         for i in range(min(6, len(mean_vals))):
@@ -1284,6 +1324,7 @@ class HDF5Viewer(QMainWindow):
             self.force_bias[i] = float(mean_vals[i])
         for spin in self.bias_spins:
             spin.blockSignals(False)
+        self._force_plot_cached = False
         self.plot_force_data(self.spin_frame.value())
 
     def _reset_bias(self):
@@ -1292,6 +1333,7 @@ class HDF5Viewer(QMainWindow):
             spin.setValue(0.0)
             spin.blockSignals(False)
         self.force_bias[:] = 0.0
+        self._force_plot_cached = False
         self.plot_force_data(self.spin_frame.value())
 
     # ──────────────────────────────────────────────
