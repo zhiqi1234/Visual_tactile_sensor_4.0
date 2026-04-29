@@ -68,22 +68,22 @@ class SerialReceiver(QThread):
         self.wait()
 
     def process_data(self):
-        FRAME_LENGTH = 29
-        while True:
-            aaaa_index = self.buffer.find(b'\xaa\xaa')
-            if aaaa_index == -1 or len(self.buffer) < aaaa_index + FRAME_LENGTH:
-                break
+            FRAME_LENGTH = 29
+            while True:
+                aaaa_index = self.buffer.find(b'\xaa\xaa')
+                if aaaa_index == -1 or len(self.buffer) < aaaa_index + FRAME_LENGTH:
+                    break # 长度不够，正常等待
 
-            if aaaa_index + FRAME_LENGTH <= len(self.buffer):
-                if self.buffer[aaaa_index + FRAME_LENGTH - 2: aaaa_index + FRAME_LENGTH] == b'\xff\xff':
-                    group_data = self.buffer[aaaa_index + 2: aaaa_index + FRAME_LENGTH - 2]
-                    timestamp = time.time() - self.start_time if self.start_time else 0
-                    self.data_received.emit(group_data, timestamp)
-                    self.buffer = self.buffer[aaaa_index + FRAME_LENGTH:]
+                if aaaa_index + FRAME_LENGTH <= len(self.buffer):
+                    if self.buffer[aaaa_index + FRAME_LENGTH - 2: aaaa_index + FRAME_LENGTH] == b'\xff\xff':
+                        group_data = self.buffer[aaaa_index + 2: aaaa_index + FRAME_LENGTH - 2]
+                        self.data_received.emit(group_data)
+                        self.buffer = self.buffer[aaaa_index + FRAME_LENGTH:]
+                    else:
+                        # 🚨 关键修复：数据错位了，把这个作废的包头扔掉，缓冲区往前推！
+                        self.buffer = self.buffer[aaaa_index + 2:]
                 else:
                     break
-            else:
-                break
 
 
 class CameraThread(QThread):

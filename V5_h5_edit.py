@@ -312,6 +312,9 @@ class HDF5Viewer(QMainWindow):
         self.btn_auto_segment = QPushButton("自动选择有效段")
         self.btn_auto_segment.setObjectName("btnAddSeg")
         self.btn_auto_segment.clicked.connect(self._auto_detect_segments)
+        self.btn_auto_press_segment = QPushButton("自动选择按压过程")
+        self.btn_auto_press_segment.setObjectName("btnAddSeg")
+        self.btn_auto_press_segment.clicked.connect(self._auto_detect_press_segments)
         self.list_segments = QListWidget()
         self.list_segments.setMaximumHeight(55)
         self.list_segments.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -319,6 +322,7 @@ class HDF5Viewer(QMainWindow):
         seg_bar.addWidget(self.btn_add_segment)
         seg_bar.addWidget(self.btn_del_segment)
         seg_bar.addWidget(self.btn_auto_segment)
+        seg_bar.addWidget(self.btn_auto_press_segment)
         seg_bar.addWidget(self.list_segments, 1)
         force_plot_layout.addLayout(seg_bar)
 
@@ -1185,6 +1189,139 @@ class HDF5Viewer(QMainWindow):
         if skipped > 0:
             msg += f"，其中 {skipped} 个包含异常帧已排除"
         msg += f"\n最终保留 {len(filtered)} 个有效片段，可拖拽边界微调"
+        QMessageBox.information(self, "自动检测完成", msg)
+
+    def _auto_detect_press_segments(self):
+        """自动检测完整按压过程：从按下开始直至释放完成"""
+        if not self.ft_data:
+            QMessageBox.warning(self, "提示", "请先加载力觉数据")
+            return
+
+        ft_ts = self.ft_data['timestamp']
+        ft_vals = self.ft_data['values'].copy()
+        n_ch = min(6, ft_vals.shape[1])
+        ft_vals[:, :n_ch] -= self.force_bias[:n_ch]
+        t_rel = ft_ts - ft_ts[0]
+
+        fz = ft_vals[:, 2]
+        n = len(fz)
+
+        if len(ft_ts) > 1:
+            sample_rate = (len(ft_ts) - 1) / (ft_ts[-1] - ft_ts[0])
+        else:
+            sample_rate = 100.0
+
+        kernel_size = max(3, int(sample_rate * 0.05))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel = np.ones(kernel_size) / kernel_size
+        fz_smooth = np.convolve(fz, kernel, mode='same')
+
+        fz_min = fz_smooth.min()
+        threshold_peak = max(fz_min * 0.10, -0.5)
+        threshold_edge = threshold_peak * 0.15
+
+        # 寻找所有负峰（与自动选择有效段相同）
+        peak_indices = []
+        i = 0
+        while i < n:
+            if fz_smooth[i] < threshold_peak:
+                min_val = fz_smooth[i]
+                min_idx = i
+                while i < n and fz_smooth[i] < threshold_peak:
+                    if fz_smooth[i] < min_val:
+                        min_val = fz_smooth[i]
+                        min_idx = i
+                    i += 1
+                peak_indices.append(min_idx)
+            else:
+                i += 1
+
+        if len(peak_indices) > 1:
+            min_peak_dist = int(sample_rate * 0.3)
+            merged_peaks = [peak_indices[0]]
+            for pk in peak_indices[1:]:
+                if pk - merged_peaks[-1] < min_peak_dist:
+                    if fz_smooth[pk] < fz_smooth[merged_peaks[-1]]:
+                        merged_peaks[-1] = pk
+                else:
+                    merged_peaks.append(pk)
+            peak_indices = merged_peaks
+
+        detected = []
+        for idx, pk in enumerate(peak_indices):
+            # 左侧搜索范围：不越过前一个峰与当前峰之间的局部最大值
+            if idx == 0:
+                search_left_limit = 0
+            else:
+                prev_pk = peak_indices[idx - 1]
+                region = fz_smooth[prev_pk:pk + 1]
+                search_left_limit = prev_pk + int(np.argmax(region))
+
+            # 右侧搜索范围：不越过当前峰与下一个峰之间的局部最大值
+            if idx == len(peak_indices) - 1:
+                search_right_limit = n - 1
+            else:
+                next_pk = peak_indices[idx + 1]
+                region = fz_smooth[pk:next_pk + 1]
+                search_right_limit = pk + int(np.argmax(region))
+
+            # 向左找按下起点
+            left = pk
+            while left > search_left_limit and fz_smooth[left - 1] < threshold_edge:
+                left -= 1
+
+            # 向右找释放终点
+            right = pk
+            while right < search_right_limit and fz_smooth[right + 1] < threshold_edge:
+                right += 1
+
+            detected.append((t_rel[left], t_rel[right]))
+
+        # 去除重叠段
+        if len(detected) > 1:
+            non_overlap = [detected[0]]
+            for s, e in detected[1:]:
+                if s > non_overlap[-1][1]:
+                    non_overlap.append((s, e))
+                else:
+                    prev_s, prev_e = non_overlap[-1]
+                    if (e - s) > (prev_e - prev_s):
+                        non_overlap[-1] = (s, e)
+            detected = non_overlap
+
+        if not detected:
+            QMessageBox.information(self, "提示", "未检测到按压过程 (fz 极小值 < -1N)")
+            return
+
+        # 过滤包含异常帧的片段
+        abnormal = self.h5_data.get('abnormal')
+        vision_ts = self.h5_data.get('timestamp')
+        filtered = []
+        skipped = 0
+        if abnormal is not None and vision_ts is not None:
+            ab_indices = np.where(abnormal)[0]
+            if len(ab_indices) > 0:
+                ab_times = vision_ts[ab_indices] + self.time_offset - ft_ts[0]
+                for s, e in detected:
+                    if np.any((ab_times >= s) & (ab_times <= e)):
+                        skipped += 1
+                    else:
+                        filtered.append([s, e])
+            else:
+                filtered = [[s, e] for s, e in detected]
+        else:
+            filtered = [[s, e] for s, e in detected]
+
+        self.segments = filtered
+        self._refresh_segment_list()
+        self._force_plot_cached = False
+        self.plot_force_data(self.spin_frame.value())
+
+        msg = f"检测到 {len(detected)} 个按压过程"
+        if skipped > 0:
+            msg += f"，其中 {skipped} 个包含异常帧已排除"
+        msg += f"\n最终保留 {len(filtered)} 个完整按压段，可拖拽边界微调"
         QMessageBox.information(self, "自动检测完成", msg)
 
     def _add_segment(self):
