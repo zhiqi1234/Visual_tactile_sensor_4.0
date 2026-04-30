@@ -51,6 +51,7 @@ class SerialReceiver(QThread):
     def run(self):
         try:
             self.serial = serial.Serial(self.port, self.baudrate, timeout=1)
+            self.serial.reset_input_buffer()  # 清空串口接收缓冲区，丢弃积压的旧数据
             self.running = True
             self.start_time = time.time()
             while self.running:

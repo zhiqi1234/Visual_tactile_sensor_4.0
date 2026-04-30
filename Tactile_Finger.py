@@ -1,5 +1,6 @@
 import sys
 import serial
+import time
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
                              QComboBox, QLabel, QGroupBox)
@@ -123,6 +124,12 @@ class TactileFinger(QWidget):
             value = data_frame[i:i + 3]
             decimal_value = self.bytes_to_decimal(value)
             voltage = (decimal_value / MAX_VALUE) * REFERENCE_VOLTAGE
+
+            # 通道0和1信号反向，需要取反
+            channel_index = i // 3
+            if channel_index == 0 or channel_index == 1:
+                voltage = -voltage
+
             decimal_data.append(voltage)
 
         if flag_adc == 0:
@@ -206,15 +213,25 @@ class SerialReceiver(QThread):
         self.serial = None
         self.running = False
         self.buffer = b''
+        self.last_clear_time = 0  # 上次清空缓冲区的时间
 
     def run(self):
         try:
             self.serial = serial.Serial(self.port, self.baudrate, timeout=1)
             self.serial.reset_input_buffer()  # 清空串口接收缓冲区，丢弃积压的旧数据
             self.running = True
+            self.last_clear_time = time.time()
             while self.running:
                 if self.serial.in_waiting > 0:
                     self.buffer += self.serial.read(self.serial.in_waiting)
+
+                    # 定期检查缓冲区大小，防止积压
+                    current_time = time.time()
+                    if len(self.buffer) > 5000 or (current_time - self.last_clear_time > 2.0 and len(self.buffer) > 1000):
+                        # 缓冲区过大或长时间未清理，保留最后1000字节，丢弃旧数据
+                        self.buffer = self.buffer[-1000:]
+                        self.last_clear_time = current_time
+
                     self.process_data()
         except serial.SerialException as e:
             print(f"串口错误: {e}")
@@ -239,7 +256,6 @@ class SerialReceiver(QThread):
                     self.data_received.emit(group_data)
                     self.buffer = self.buffer[aaaa_index + FRAME_LENGTH:]
                 else:
-                    # 🚨 关键修复：数据错位了，把这个作废的包头扔掉，缓冲区往前推！
                     self.buffer = self.buffer[aaaa_index + 2:]
             else:
                 break
