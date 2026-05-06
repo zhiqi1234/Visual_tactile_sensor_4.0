@@ -128,12 +128,14 @@ class ForcePredictor:
                          disp_norm.mean(), disp_sum, concentration, avg_contact_disp,
                          pressure_index, entropy], dtype=np.float32)
 
-    def predict(self, dxyz):
+    def predict(self, dxyz, piezo_feat=None):
         """
         单帧预测。
 
         Args:
             dxyz: np.ndarray, shape (N, 3) 或 (N*3,)，N 个 marker 点的位移
+            piezo_feat: np.ndarray, shape (5,)，压电统计特征（可选）
+                        [mean, std, rms, max, energy]
 
         Returns:
             np.ndarray, shape (output_dim,) — 预测的力/力矩
@@ -141,6 +143,14 @@ class ForcePredictor:
         x_flat = np.asarray(dxyz, dtype=np.float32).flatten()
         contact_feat = self._extract_contact_features(dxyz)
         x = np.concatenate([x_flat, contact_feat])
+
+        # 如果模型需要压电特征
+        if self.config.get('use_piezo', False):
+            if piezo_feat is not None:
+                x = np.concatenate([x, np.asarray(piezo_feat, dtype=np.float32)])
+            else:
+                # 无压电数据时填零（降级使用）
+                x = np.concatenate([x, np.zeros(5, dtype=np.float32)])
 
         x_t = torch.tensor(x, device=self.device).unsqueeze(0)
         x_t = (x_t - self._x_mean_t) / self._x_std_t
@@ -151,12 +161,13 @@ class ForcePredictor:
         y_t = y_t * self._y_std_t + self._y_mean_t - self._bias_t
         return y_t.cpu().numpy()[0]
 
-    def predict_batch(self, dxyz_batch):
+    def predict_batch(self, dxyz_batch, piezo_feat_batch=None):
         """
         批量预测。
 
         Args:
             dxyz_batch: np.ndarray, shape (T, N, 3) 或 (T, N*3)
+            piezo_feat_batch: np.ndarray, shape (T, 5)，压电统计特征（可选）
 
         Returns:
             np.ndarray, shape (T, output_dim)
@@ -172,6 +183,13 @@ class ForcePredictor:
         # 批量提取接触特征
         contact_feats = np.array([self._extract_contact_features(x_flat[i]) for i in range(T)])
         x = np.concatenate([x_flat, contact_feats], axis=1)
+
+        # 如果模型需要压电特征
+        if self.config.get('use_piezo', False):
+            if piezo_feat_batch is not None:
+                x = np.concatenate([x, np.asarray(piezo_feat_batch, dtype=np.float32)], axis=1)
+            else:
+                x = np.concatenate([x, np.zeros((T, 5), dtype=np.float32)], axis=1)
 
         x_t = torch.tensor(x, device=self.device)
         x_t = (x_t - self._x_mean_t) / self._x_std_t

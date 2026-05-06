@@ -9,12 +9,13 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFileDialog, QTextEdit,
     QGroupBox, QSlider, QSpinBox, QDoubleSpinBox,
     QDockWidget, QListWidget, QAbstractItemView, QMessageBox,
-    QScrollBar, QSplitter,
+    QScrollBar, QSplitter, QComboBox,
 )
 from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
+import pyqtgraph as pg
 
 
 class HDF5Viewer(QMainWindow):
@@ -25,6 +26,7 @@ class HDF5Viewer(QMainWindow):
 
         self.h5_data = {}
         self.ft_data = {}
+        self.piezo_data = {}  # 压电数据
         self.total_frames = 0
         self._saved_view = None
         self._saved_force3d_view = None
@@ -48,6 +50,10 @@ class HDF5Viewer(QMainWindow):
 
         # 力传感器静态偏差
         self.force_bias = np.zeros(6)
+
+        # 压电传感器相关
+        self.piezo_channel = 0  # 当前选择的通道（0-7）
+        self.piezo_window_ms = 33  # 时间窗口（毫秒）
 
         # 文件导航
         self._current_dir = ""
@@ -295,6 +301,49 @@ class HDF5Viewer(QMainWindow):
         plot_layout.addWidget(plot_splitter)
         main_layout.addWidget(plot_group, 3)
 
+        # ── 压电信号控件 ──
+        piezo_control_group = QGroupBox("压电信号")
+        piezo_control_layout = QHBoxLayout(piezo_control_group)
+        piezo_control_layout.setContentsMargins(8, 20, 8, 8)
+
+        lbl_piezo_ch = QLabel("通道:")
+        self.cbb_piezo_channel = QComboBox()
+        self.cbb_piezo_channel.addItems([f"CH{i+1}" for i in range(8)])
+        self.cbb_piezo_channel.setCurrentIndex(0)
+        self.cbb_piezo_channel.currentIndexChanged.connect(self._on_piezo_channel_changed)
+
+        lbl_piezo_window = QLabel("窗口:")
+        self.spin_piezo_window = QSpinBox()
+        self.spin_piezo_window.setRange(10, 100)
+        self.spin_piezo_window.setValue(33)
+        self.spin_piezo_window.setSuffix(" ms")
+        self.spin_piezo_window.valueChanged.connect(self._on_piezo_window_changed)
+
+        piezo_control_layout.addWidget(lbl_piezo_ch)
+        piezo_control_layout.addWidget(self.cbb_piezo_channel)
+        piezo_control_layout.addWidget(lbl_piezo_window)
+        piezo_control_layout.addWidget(self.spin_piezo_window)
+        piezo_control_layout.addStretch()
+        main_layout.addWidget(piezo_control_group)
+
+        # 压电波形图（PyQtGraph）
+        piezo_plot_group = QGroupBox("压电信号波形")
+        piezo_plot_layout = QVBoxLayout(piezo_plot_group)
+        piezo_plot_layout.setContentsMargins(8, 20, 8, 8)
+
+        self.piezo_plot_widget = pg.GraphicsLayoutWidget()
+        self.piezo_plot_widget.setBackground('w')
+        self.piezo_plot = self.piezo_plot_widget.addPlot(title="压电信号 (选中通道)")
+        self.piezo_plot.setLabel('left', '电压 (V)')
+        self.piezo_plot.setLabel('bottom', '时间 (s)')
+        self.piezo_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.piezo_curve = self.piezo_plot.plot(pen=pg.mkPen('b', width=1))
+        self.piezo_vline = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('r', width=2, style=pg.QtCore.Qt.DashLine))
+        self.piezo_plot.addItem(self.piezo_vline)
+
+        piezo_plot_layout.addWidget(self.piezo_plot_widget)
+        main_layout.addWidget(piezo_plot_group, 1)
+
         # ── 力觉数据 + 有效段控件 ──
         force_plot_group = QGroupBox("力觉数据")
         force_plot_layout = QVBoxLayout(force_plot_group)
@@ -502,6 +551,7 @@ class HDF5Viewer(QMainWindow):
     def load_force_file(self, filepath):
         """加载力觉数据文件"""
         self.ft_data = {}
+        self.piezo_data = {}
         self._is_from_processed = False
         # 重置力偏差，避免旧偏差应用到新文件
         self.force_bias[:] = 0.0
@@ -525,6 +575,15 @@ class HDF5Viewer(QMainWindow):
                 if isinstance(cols, bytes):
                     cols = cols.decode('utf-8')
                 self.ft_data['columns'] = cols.split(',')
+
+                # 加载压电数据（如果存在）
+                if 'piezo' in f:
+                    piezo_grp = f['piezo']
+                    if 'timestamp' in piezo_grp and 'values' in piezo_grp:
+                        self.piezo_data['timestamp'] = piezo_grp['timestamp'][:]
+                        self.piezo_data['values'] = piezo_grp['values'][:]
+                        self.piezo_data['channel'] = int(piezo_grp.attrs.get('channel', 1))
+                        print(f"已加载压电数据: {len(self.piezo_data['timestamp'])} 采样, 通道 CH{self.piezo_data['channel']}")
         except Exception as e:
             self.statusBar().showMessage(f"读取力觉文件失败: {e}")
             return
@@ -545,10 +604,24 @@ class HDF5Viewer(QMainWindow):
         for i, col in enumerate(self.ft_data['columns']):
             v = ft_vals[:, i]
             lines.append(f"  {col}: min={v.min():.4f}  max={v.max():.4f}  mean={v.mean():.4f}")
+
+        # 压电数据摘要
+        if self.piezo_data:
+            piezo_ts = self.piezo_data['timestamp']
+            piezo_vals = self.piezo_data['values']
+            lines += ["", "=" * 50, "  压电数据信息", "=" * 50,
+                     f"采样数: {len(piezo_ts)}", f"通道: CH{self.piezo_data['channel']}"]
+            if len(piezo_ts) > 1:
+                dur = piezo_ts[-1] - piezo_ts[0]
+                rate = (len(piezo_ts) - 1) / dur if dur > 0 else 0
+                lines += [f"总时长: {dur:.2f} s", f"采样率: {rate:.1f} Hz"]
+            lines.append(f"  电压范围: {piezo_vals.min():.4f} ~ {piezo_vals.max():.4f} V")
+
         self.txt_info.append("\n".join(lines))
         self.statusBar().showMessage(f"已加载力觉文件: {os.path.basename(filepath)} | 采样数: {len(ft_ts)}")
         self._force_plot_cached = False
         self.plot_force_data()
+        self.update_piezo_plot()
 
     def load_file(self, filepath):
         """加载点云标定数据文件"""
@@ -704,6 +777,7 @@ class HDF5Viewer(QMainWindow):
             self.lbl_frame.setText(f"帧: {frame_idx} / {self.total_frames - 1}")
         self.plot_frame(frame_idx)
         self.plot_force_data(frame_idx)
+        self.update_piezo_plot(frame_idx)
 
     def plot_frame(self, frame_idx):
         xyz = self.h5_data['xyz']
@@ -1474,6 +1548,71 @@ class HDF5Viewer(QMainWindow):
         self.plot_force_data(self.spin_frame.value())
 
     # ──────────────────────────────────────────────
+    #  压电信号相关方法
+    # ──────────────────────────────────────────────
+    def _on_piezo_channel_changed(self, index):
+        """压电通道切换"""
+        self.piezo_channel = index
+        self.update_piezo_plot()
+
+    def _on_piezo_window_changed(self, value):
+        """时间窗口大小改变"""
+        self.piezo_window_ms = value
+
+    def update_piezo_plot(self, frame_idx=None):
+        """更新压电波形显示"""
+        if not self.piezo_data:
+            self.piezo_curve.setData([], [])
+            return
+
+        piezo_ts = self.piezo_data['timestamp']
+        piezo_vals = self.piezo_data['values']
+
+        # 转换为相对时间（相对于压电数据起点）
+        t_rel = piezo_ts - piezo_ts[0]
+        self.piezo_curve.setData(t_rel, piezo_vals)
+
+        # 更新当前帧标记线
+        if frame_idx is not None and 'timestamp' in self.h5_data and self.ft_data:
+            vision_ts = self.h5_data['timestamp']
+            ft_ts = self.ft_data['timestamp']
+            cur_abs = vision_ts[frame_idx] + self.time_offset
+            # 压电时间相对于压电数据起点
+            cur_piezo_rel = cur_abs - piezo_ts[0]
+            self.piezo_vline.setPos(cur_piezo_rel)
+
+    def extract_piezo_window_features(self, vision_timestamp, piezo_ts, piezo_vals, window_ms=33):
+        """提取时间窗口 [T-window_ms, T] 内的压电统计特征
+
+        Args:
+            vision_timestamp: 视觉帧绝对时间戳
+            piezo_ts: 压电时间戳数组
+            piezo_vals: 压电电压值数组
+            window_ms: 时间窗口大小（毫秒）
+
+        Returns:
+            np.ndarray, shape (5,): [mean, std, rms, max, energy]
+        """
+        window_sec = window_ms / 1000.0
+        t_start = vision_timestamp - window_sec
+        t_end = vision_timestamp
+
+        mask = (piezo_ts >= t_start) & (piezo_ts <= t_end)
+        window_vals = piezo_vals[mask]
+
+        if len(window_vals) == 0:
+            return np.zeros(5, dtype=np.float32)
+
+        window_vals = window_vals.astype(np.float32)
+        return np.array([
+            np.mean(window_vals),
+            np.std(window_vals),
+            np.sqrt(np.mean(window_vals ** 2)),
+            np.max(np.abs(window_vals)),
+            np.sum(np.abs(window_vals))
+        ], dtype=np.float32)
+
+    # ──────────────────────────────────────────────
     #  保存处理数据
     # ──────────────────────────────────────────────
     def _save_processed(self):
@@ -1577,6 +1716,25 @@ class HDF5Viewer(QMainWindow):
                 fg.create_dataset('values', data=save_force)
                 fg.create_dataset('segment_id', data=seg_id_arr[valid_idx])
                 fg.attrs['columns'] = ','.join(self.ft_data['columns'])
+
+                # 提取并保存压电特征（如果有压电数据）
+                if self.piezo_data:
+                    piezo_ts = self.piezo_data['timestamp']
+                    piezo_vals = self.piezo_data['values']
+                    window_ms = self.piezo_window_ms
+
+                    piezo_features = []
+                    for ts in save_ts:
+                        feat = self.extract_piezo_window_features(ts, piezo_ts, piezo_vals, window_ms)
+                        piezo_features.append(feat)
+                    piezo_features = np.array(piezo_features, dtype=np.float32)
+
+                    pg_grp = f.create_group('piezo')
+                    pg_grp.create_dataset('features', data=piezo_features)
+                    pg_grp.attrs['feature_names'] = 'mean,std,rms,max,energy'
+                    pg_grp.attrs['window_ms'] = self.piezo_window_ms
+                    pg_grp.attrs['source_channel'] = self.piezo_data.get('channel', 1)
+                    print(f"已保存压电特征: {piezo_features.shape}")
 
                 mg = f.create_group('meta')
                 mg.attrs['is_processed'] = True

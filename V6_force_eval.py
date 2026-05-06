@@ -46,9 +46,10 @@ def load_model_and_data(model_dir, data_dir):
                                      map_location=device, weights_only=True))
     model.eval()
 
-    # 数据
+    # 数据（使用与训练时相同的use_piezo设置）
+    use_piezo = config.get('use_piezo', False)
     h5_files = sorted(glob.glob(os.path.join(data_dir, "processed_*.h5")))
-    dataset = ForceDataset(h5_files, force_dims=config['output_dim'])
+    dataset = ForceDataset(h5_files, force_dims=config['output_dim'], use_piezo=use_piezo)
     dataset.set_scaler(scaler)  # 使用训练时保存的 scaler
 
     # 划分索引
@@ -289,6 +290,8 @@ def main():
                         help="processed_*.h5 所在目录")
     parser.add_argument('--model_dir', type=str, default=None,
                         help="模型输出目录")
+    parser.add_argument('--baseline_dir', type=str, default=None,
+                        help="基线模型目录（用于消融实验对比，可选）")
     args = parser.parse_args()
 
     # 如果未指定 model_dir，弹出选择对话框

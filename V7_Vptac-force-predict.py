@@ -28,11 +28,14 @@ from datetime import datetime
 import numpy as np
 import h5py
 import cv2
+import serial
+import serial.tools.list_ports
 import topic  # type: ignore
 import message  # type: ignore
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
                              QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox,
-                             QGroupBox, QStatusBar, QSpinBox, QSplitter, QCheckBox)
+                             QGroupBox, QStatusBar, QSpinBox, QSplitter, QCheckBox,
+                             QComboBox)
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -41,12 +44,96 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.spatial import Delaunay, cKDTree
 from scipy.optimize import linear_sum_assignment
+import pyqtgraph as pg
 
 from V6_force_predict_lightnet import ForcePredictor
 
 # 中文字体配置
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
+
+
+# ─────────────────────── 压电串口采集线程 ───────────────────────
+
+class PiezoSerialThread(QThread):
+    """压电传感器串口采集线程（从Tactile_Finger.py移植）"""
+    data_received = pyqtSignal(int, list, float)  # (adc_group, voltage_list, timestamp)
+
+    def __init__(self, port='COM1', baudrate=921600):
+        super().__init__()
+        self.port = port
+        self.baudrate = baudrate
+        self.serial = None
+        self.running = False
+        self.buffer = b''
+        self.last_clear_time = 0
+
+    def run(self):
+        try:
+            self.serial = serial.Serial(self.port, self.baudrate, timeout=1)
+            self.serial.reset_input_buffer()
+            self.running = True
+            self.last_clear_time = time.time()
+
+            while self.running:
+                if self.serial.in_waiting > 0:
+                    self.buffer += self.serial.read(self.serial.in_waiting)
+
+                    current_time = time.time()
+                    if len(self.buffer) > 5000 or (current_time - self.last_clear_time > 2.0 and len(self.buffer) > 1000):
+                        self.buffer = self.buffer[-1000:]
+                        self.last_clear_time = current_time
+
+                    self.process_data()
+        except serial.SerialException as e:
+            print(f"压电串口错误: {e}")
+
+    def stop(self):
+        self.running = False
+        if self.serial and self.serial.is_open:
+            self.serial.close()
+        self.quit()
+        self.wait()
+
+    def process_data(self):
+        FRAME_LENGTH = 29
+        REFERENCE_VOLTAGE = 3.3
+        MAX_VALUE = 2 ** 23
+
+        while True:
+            aaaa_index = self.buffer.find(b'\xaa\xaa')
+            if aaaa_index == -1 or len(self.buffer) < aaaa_index + FRAME_LENGTH:
+                break
+
+            if aaaa_index + FRAME_LENGTH <= len(self.buffer):
+                if self.buffer[aaaa_index + FRAME_LENGTH - 2: aaaa_index + FRAME_LENGTH] == b'\xff\xff':
+                    group_data = self.buffer[aaaa_index + 2: aaaa_index + FRAME_LENGTH - 2]
+                    flag_adc = group_data[0]
+                    data_frame = group_data[1:]
+
+                    voltages = []
+                    for i in range(0, len(data_frame), 3):
+                        value = data_frame[i:i + 3]
+                        decimal_value = self.bytes_to_decimal(value)
+                        voltage = (decimal_value / MAX_VALUE) * REFERENCE_VOLTAGE
+                        channel_index = i // 3
+                        if channel_index == 0 or channel_index == 1:
+                            voltage = -voltage
+                        voltages.append(voltage)
+
+                    self.data_received.emit(flag_adc, voltages, time.time())
+                    self.buffer = self.buffer[aaaa_index + FRAME_LENGTH:]
+                else:
+                    self.buffer = self.buffer[aaaa_index + 2:]
+            else:
+                break
+
+    def bytes_to_decimal(self, data):
+        byte1, byte2, byte3 = data
+        adc_value = (byte1 << 16) | (byte2 << 8) | byte3
+        if adc_value & 0x800000:
+            adc_value -= 0x1000000
+        return adc_value
 
 
 # ─────────────────────── 相机线程 ───────────────────────
@@ -351,6 +438,13 @@ class V7MainWindow(QMainWindow):
         self.force_predictor = None  # type: ForcePredictor | None
         self.latest_predicted_force = None  # (output_dim,) ndarray
 
+        # 压电传感器相关
+        self.piezo_thread = None
+        self.piezo_channel = 0  # 选择的通道（0-7）
+        self.piezo_buffer = deque(maxlen=2000)  # 环形缓冲区：(timestamp, voltage)
+        self.piezo_window_ms = 33  # 时间窗口（毫秒）
+        self.piezo_lock = threading.Lock()
+
         # 六维力传感器
         self.ft_node = None
         self.ft_subscription = None
@@ -466,6 +560,23 @@ class V7MainWindow(QMainWindow):
                   self.spin_speed, self.spin_max_dist, self.lbl_camera,
                   self.spin_camera_idx, self.chk_rotate]:
             control_layout.addWidget(w)
+
+        # 压电传感器控件
+        lbl_piezo = QLabel("压电:")
+        self.cbb_piezo_port = QComboBox()
+        self.cbb_piezo_port.addItems(self._get_serial_ports())
+        self.cbb_piezo_port.setMinimumWidth(80)
+
+        self.cbb_piezo_channel = QComboBox()
+        self.cbb_piezo_channel.addItems([f"CH{i+1}" for i in range(8)])
+        self.cbb_piezo_channel.currentIndexChanged.connect(lambda i: setattr(self, 'piezo_channel', i))
+
+        self.btn_piezo_connect = QPushButton("连接压电")
+        self.btn_piezo_connect.clicked.connect(self.toggle_piezo_connection)
+
+        for w in [lbl_piezo, self.cbb_piezo_port, self.cbb_piezo_channel, self.btn_piezo_connect]:
+            control_layout.addWidget(w)
+
         control_layout.addStretch()
         control_group.setLayout(control_layout)
         main_layout.addWidget(control_group)
@@ -524,7 +635,25 @@ class V7MainWindow(QMainWindow):
         force_layout.addWidget(self.canvas_force)
 
         main_splitter.addWidget(force_widget)
-        main_splitter.setSizes([500, 500])  # 上下各半，力图不被压扁
+
+        # 压电信号实时波形（PyQtGraph）
+        piezo_group = QGroupBox("压电信号实时波形")
+        piezo_layout = QVBoxLayout(piezo_group)
+        piezo_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.piezo_plot_widget = pg.GraphicsLayoutWidget()
+        self.piezo_plot_widget.setBackground('w')
+        self.piezo_plot = self.piezo_plot_widget.addPlot(title="压电信号 (选中通道)")
+        self.piezo_plot.setYRange(-3.3, 3.3)
+        self.piezo_plot.setLabel('left', '电压 (V)')
+        self.piezo_plot.setLabel('bottom', '采样点')
+        self.piezo_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.piezo_curve = self.piezo_plot.plot(pen=pg.mkPen('b', width=1))
+
+        piezo_layout.addWidget(self.piezo_plot_widget)
+        main_splitter.addWidget(piezo_group)
+
+        main_splitter.setSizes([500, 400, 100])
         main_layout.addWidget(main_splitter)
 
         # 状态栏
@@ -541,6 +670,90 @@ class V7MainWindow(QMainWindow):
         self.force_plot_timer = QTimer(self)
         self.force_plot_timer.timeout.connect(self.update_force_plot)
         self.force_plot_timer.start(333)
+
+    # ──────────────────── 压电传感器 ────────────────────
+
+    def _get_serial_ports(self):
+        """获取可用串口列表"""
+        try:
+            ports = serial.tools.list_ports.comports()
+            return [port.device for port in ports]
+        except Exception:
+            return []
+
+    def toggle_piezo_connection(self):
+        """切换压电传感器连接状态"""
+        if self.piezo_thread is None or not self.piezo_thread.isRunning():
+            port = self.cbb_piezo_port.currentText()
+            if not port:
+                QMessageBox.warning(self, "警告", "请选择压电串口")
+                return
+
+            self.piezo_thread = PiezoSerialThread(port, 921600)
+            self.piezo_thread.data_received.connect(self.on_piezo_data)
+            self.piezo_thread.start()
+
+            self.btn_piezo_connect.setText("断开压电")
+            self.status_bar.showMessage(f"压电传感器已连接: {port}")
+        else:
+            self.piezo_thread.stop()
+            self.piezo_thread = None
+            self.btn_piezo_connect.setText("连接压电")
+            self.status_bar.showMessage("压电传感器已断开")
+
+    def on_piezo_data(self, adc_group, voltages, timestamp):
+        """压电数据回调"""
+        selected_ch = self.piezo_channel
+        if selected_ch < len(voltages):
+            with self.piezo_lock:
+                self.piezo_buffer.append((timestamp, voltages[selected_ch]))
+
+        # 每20次更新一次波形（降低刷新频率）
+        if not hasattr(self, '_piezo_update_counter'):
+            self._piezo_update_counter = 0
+        self._piezo_update_counter += 1
+        if self._piezo_update_counter >= 20:
+            self._piezo_update_counter = 0
+            self._update_piezo_plot()
+
+    def _update_piezo_plot(self):
+        """更新压电波形显示"""
+        with self.piezo_lock:
+            buf = list(self.piezo_buffer)
+
+        if len(buf) == 0:
+            return
+
+        y_data = [v for _, v in buf[-2000:]]
+        x_data = list(range(len(y_data)))
+        self.piezo_curve.setData(x_data, y_data)
+
+    def extract_realtime_piezo_features(self, current_timestamp=None):
+        """从环形缓冲区提取最新时间窗口的统计特征
+
+        Returns:
+            np.ndarray, shape (5,): [mean, std, rms, max, energy]
+        """
+        if current_timestamp is None:
+            current_timestamp = time.time()
+
+        window_sec = self.piezo_window_ms / 1000.0
+        t_start = current_timestamp - window_sec
+
+        with self.piezo_lock:
+            window_vals = [v for t, v in self.piezo_buffer if t_start <= t <= current_timestamp]
+
+        if len(window_vals) == 0:
+            return np.zeros(5, dtype=np.float32)
+
+        window_vals = np.array(window_vals, dtype=np.float32)
+        return np.array([
+            np.mean(window_vals),
+            np.std(window_vals),
+            np.sqrt(np.mean(window_vals ** 2)),
+            np.max(np.abs(window_vals)),
+            np.sum(np.abs(window_vals))
+        ], dtype=np.float32)
 
     # ──────────────────── 六维力传感器 ────────────────────
 
@@ -1045,7 +1258,7 @@ class V7MainWindow(QMainWindow):
     # ──────────────────── 力预测 ────────────────────
 
     def _predict_force(self, points_3d):
-        """用 dxyz 做力预测，返回 ndarray 或 None"""
+        """用 dxyz + 压电特征做力预测，返回 ndarray 或 None"""
         if self.force_predictor is None:
             return None
         base_3d = self.FRAME_DATA['base_3d_points']
@@ -1055,7 +1268,13 @@ class V7MainWindow(QMainWindow):
             local_xyz = self.get_local_coords(points_3d)
             base_local = self.get_local_coords(base_3d)
             dxyz = (local_xyz - base_local).astype(np.float32)  # (N, 3)
-            return self.force_predictor.predict(dxyz)
+
+            # 如果模型需要压电特征，实时提取
+            piezo_feat = None
+            if self.force_predictor.config.get('use_piezo', False):
+                piezo_feat = self.extract_realtime_piezo_features()
+
+            return self.force_predictor.predict(dxyz, piezo_feat)
         except Exception as e:
             print(f"力预测失败: {e}")
             return None
@@ -2125,6 +2344,10 @@ class V7MainWindow(QMainWindow):
         if self.is_recording:
             self.stop_recording()
         self.force_plot_timer.stop()
+        # 停止压电传感器
+        if self.piezo_thread is not None:
+            self.piezo_thread.stop()
+            self.piezo_thread = None
         if self.ft_node is not None:
             self.ft_subscription = None
             try:

@@ -27,12 +27,13 @@ class ForceDataset(Dataset):
     这样可以确保 scaler 只基于训练集计算，避免数据泄漏。
     """
 
-    def __init__(self, h5_files, force_dims=6, contact_threshold=0.02):
-        self.X = []  # dxyz 展平 + 接触特征
+    def __init__(self, h5_files, force_dims=6, contact_threshold=0.02, use_piezo=False):
+        self.X = []  # dxyz 展平 + 接触特征 (+ 压电特征)
         self.y = []  # force
         self.file_info = []  # 记录每个样本来源及其在总数组中的起止索引
         self.segment_info = []  # 记录每个segment的起止索引: [(start_idx, end_idx, file_idx), ...]
         self.contact_threshold = contact_threshold
+        self.use_piezo = use_piezo  # 是否使用压电特征
 
         for file_idx, fpath in enumerate(h5_files):
             with h5py.File(fpath, 'r') as f:
@@ -76,11 +77,23 @@ class ForceDataset(Dataset):
                     t_rel = timestamps - timestamps[0]
 
                 # 提取接触特征
-                contact_features = self._extract_contact_features(dxyz)  # (T, 7)
+                contact_features = self._extract_contact_features(dxyz)  # (T, 9)
 
                 # 拼接：dxyz展平 + 接触特征
                 x_flat = dxyz.reshape(T, -1).astype(np.float32)  # (T, 180)
-                x_combined = np.concatenate([x_flat, contact_features], axis=1)  # (T, 187)
+                x_combined = np.concatenate([x_flat, contact_features], axis=1)  # (T, 189)
+
+                # 如果使用压电特征，加载并拼接
+                if self.use_piezo and 'piezo/features' in f:
+                    piezo_feat = f['piezo/features'][:]  # (T, 5): mean, std, rms, max, energy
+                    if piezo_feat.shape[0] == T:
+                        x_combined = np.concatenate([x_combined, piezo_feat], axis=1)  # (T, 194)
+                        print(f"  [压电特征] 已加载: {piezo_feat.shape}")
+                    else:
+                        print(f"  [警告] 压电特征长度不匹配: {piezo_feat.shape[0]} vs {T}")
+                elif self.use_piezo:
+                    print(f"  [警告] 文件中无压电特征，跳过")
+
                 y_flat = force.astype(np.float32)                 # (T, 6)
 
                 offset = sum(info[1] for info in self.file_info)
@@ -495,7 +508,7 @@ def train(args):
 
     # ── 加载数据（加载所有选中的文件） ──
     all_files = train_val_files + [f for f in test_files if f not in train_val_files]
-    dataset = ForceDataset(all_files, force_dims=args.force_dims)
+    dataset = ForceDataset(all_files, force_dims=args.force_dims, use_piezo=args.use_piezo)
 
     # ── 划分数据（先划分，再算 scaler，杜绝泄漏） ──
     # 使用基于segment的划分方式
@@ -662,6 +675,7 @@ def train(args):
         'train_samples': len(train_idx),
         'val_samples': len(val_idx),
         'test_samples': len(test_idx),
+        'use_piezo': args.use_piezo,
         'timestamp': datetime.now().strftime('%Y%m%d_%H%M%S'),
     }
     with open(os.path.join(save_dir, "train_config.json"), 'w', encoding='utf-8') as f:
@@ -712,6 +726,8 @@ def main():
                         choices=['plateau', 'cosine'], help="学习率调度器")
     parser.add_argument('--no_interact', action='store_true',
                         help="非交互模式：所有文件用于训练+验证，无独立测试文件")
+    parser.add_argument('--use_piezo', action='store_true',
+                        help="使用压电特征（需要processed文件中包含/piezo/features）")
 
     args = parser.parse_args()
     train(args)
