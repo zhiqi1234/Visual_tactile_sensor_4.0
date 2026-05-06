@@ -10,6 +10,7 @@
 6. 支持"设置为首帧"动态更新基准帧
 7. 六维力传感器实时订阅与显示
 8. HDF5数据采集：同步记录视觉3D坐标(xyz/dxyz)和六维力传感器数据(fx,fy,fz,mx,my,mz)
+9. 压电传感器采集：串口读取全部8通道原始数据，实时波形显示，与视觉同步保存到HDF5
 '''
 import sys
 import signal
@@ -20,16 +21,19 @@ sys.path.insert(0, _utils_dir)
 import json
 import time
 import threading
+from collections import deque
 from datetime import datetime
 import numpy as np
 import h5py
 import cv2
+import serial
+import serial.tools.list_ports
 import topic # type: ignore
 import message # type: ignore
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, QPushButton,
                              QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox,
                              QGroupBox, QStatusBar, QSlider, QSpinBox, QSplitter,
-                             QCheckBox)
+                             QCheckBox, QComboBox)
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -40,6 +44,156 @@ from scipy.spatial import cKDTree, Delaunay
 from scipy.interpolate import Rbf
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
+import pyqtgraph as pg
+
+
+class PiezoSerialThread(QThread):
+    """压电传感器串口采集线程
+    - 采集线程内部维护缓冲区，不通过高频 signal 打断主线程
+    - 保存全部8通道原始数据，供后续任意选通道分析
+    - 每积累 plot_interval 帧才发一次低频 plot_ready 信号刷新波形
+    """
+    plot_ready = pyqtSignal()  # 低频刷新信号，约5-10Hz
+
+    # 帧格式常量
+    _FRAME_LEN = 29
+    _REF_V = 3.3
+    _MAX_VAL = 2 ** 23
+
+    def __init__(self, port='COM1', baudrate=921600, plot_interval=50):
+        super().__init__()
+        self.port = port
+        self.baudrate = baudrate
+        self.running = False
+        self._serial = None
+        self._rx_buf = b''
+        self._last_clear_time = 0
+
+        # 共享缓冲区：(timestamp, ch0, ch1, ..., ch7)，线程写，主线程读
+        self._shared_buf = deque(maxlen=3000)
+        self._buf_lock = threading.Lock()
+
+        # 波形显示用：当前预览通道（主线程可随时改，int赋值原子安全）
+        self._preview_ch = 0
+
+        # 节流计数
+        self._plot_counter = 0
+        self._plot_interval = plot_interval
+
+    # ── 主线程调用的接口 ──────────────────────────────────
+
+    def set_preview_channel(self, ch):
+        """切换波形预览通道（0-7），无需加锁"""
+        self._preview_ch = max(0, min(7, ch))
+
+    def get_plot_data(self):
+        """获取当前预览通道的波形数据（用于 PyQtGraph 刷新）
+        返回 np.ndarray 电压序列，最多2000点
+        """
+        with self._buf_lock:
+            buf = list(self._shared_buf)
+        if not buf:
+            return np.array([], dtype=np.float32)
+        ch = self._preview_ch + 1  # buf 每行: (ts, ch0..ch7)，索引+1
+        return np.array([row[ch] for row in buf[-2000:]], dtype=np.float32)
+
+    def get_recording_snapshot(self):
+        """获取完整缓冲区快照用于保存（返回 timestamps 和 all_channels）
+        timestamps: (N,) float64
+        values:     (N, 8) float32
+        """
+        with self._buf_lock:
+            buf = list(self._shared_buf)
+        if not buf:
+            return np.array([], dtype=np.float64), np.zeros((0, 8), dtype=np.float32)
+        timestamps = np.array([row[0] for row in buf], dtype=np.float64)
+        values = np.array([row[1:] for row in buf], dtype=np.float32)  # (N, 8)
+        return timestamps, values
+
+    def clear_buffer(self):
+        """采集开始时清空缓冲区"""
+        with self._buf_lock:
+            self._shared_buf.clear()
+
+    # ── 线程主循环 ────────────────────────────────────────
+
+    def run(self):
+        try:
+            self._serial = serial.Serial(self.port, self.baudrate, timeout=1)
+            self._serial.reset_input_buffer()
+            self.running = True
+            self._last_clear_time = time.time()
+
+            while self.running:
+                if self._serial.in_waiting > 0:
+                    self._rx_buf += self._serial.read(self._serial.in_waiting)
+
+                    # 防积压：缓冲区过大时丢弃旧数据
+                    now = time.time()
+                    if len(self._rx_buf) > 5000 or (
+                            now - self._last_clear_time > 2.0 and len(self._rx_buf) > 1000):
+                        self._rx_buf = self._rx_buf[-1000:]
+                        self._last_clear_time = now
+
+                    self._process_frames()
+                else:
+                    time.sleep(0.0005)  # 无数据时短暂休眠，避免空转
+        except serial.SerialException as e:
+            print(f"[PiezoSerialThread] 串口错误: {e}")
+
+    def stop(self):
+        self.running = False
+        if self._serial and self._serial.is_open:
+            self._serial.close()
+        self.quit()
+        self.wait()
+
+    def _process_frames(self):
+        """从接收缓冲区解析完整帧，写入共享缓冲区"""
+        while True:
+            idx = self._rx_buf.find(b'\xaa\xaa')
+            if idx == -1 or len(self._rx_buf) < idx + self._FRAME_LEN:
+                break
+
+            tail = self._rx_buf[idx + self._FRAME_LEN - 2: idx + self._FRAME_LEN]
+            if tail != b'\xff\xff':
+                self._rx_buf = self._rx_buf[idx + 2:]
+                continue
+
+            payload = self._rx_buf[idx + 2: idx + self._FRAME_LEN - 2]
+            self._rx_buf = self._rx_buf[idx + self._FRAME_LEN:]
+
+            # payload[0] = ADC组标识（0-4），payload[1:] = 8通道×3字节
+            data_bytes = payload[1:]
+            if len(data_bytes) < 24:
+                continue
+
+            ts = time.time()
+            voltages = []
+            for ch in range(8):
+                raw = data_bytes[ch * 3: ch * 3 + 3]
+                val = self._bytes_to_decimal(raw)
+                v = (val / self._MAX_VAL) * self._REF_V
+                if ch == 0 or ch == 1:
+                    v = -v
+                voltages.append(v)
+
+            with self._buf_lock:
+                self._shared_buf.append((ts, *voltages))  # (ts, v0..v7)
+
+            # 节流：每 _plot_interval 帧发一次刷新信号
+            self._plot_counter += 1
+            if self._plot_counter >= self._plot_interval:
+                self._plot_counter = 0
+                self.plot_ready.emit()
+
+    @staticmethod
+    def _bytes_to_decimal(data):
+        b1, b2, b3 = data
+        v = (b1 << 16) | (b2 << 8) | b3
+        if v & 0x800000:
+            v -= 0x1000000
+        return v
 
 
 class CameraThread(QThread):
@@ -354,6 +508,12 @@ class VideoPointCloudPlayer(QMainWindow):
             'ft_values': [],  # 每个元素为 [fx, fy, fz, mx, my, mz]
         }
 
+        # 压电传感器相关
+        self.piezo_thread = None          # PiezoSerialThread 实例
+        self.piezo_preview_ch = 0         # 当前波形预览通道（0-7）
+        # 采集时记录的起始时间戳，用于截取本次采集段
+        self._piezo_record_start_ts = 0.0
+
         # 初始化界面
         self.init_ui()
 
@@ -429,6 +589,30 @@ class VideoPointCloudPlayer(QMainWindow):
         control_layout.addWidget(self.lbl_camera)
         control_layout.addWidget(self.spin_camera_idx)
         control_layout.addWidget(self.chk_rotate)
+
+        # ── 压电传感器控件 ──
+        control_layout.addWidget(QLabel("  |  压电:"))
+
+        self.cbb_piezo_port = QComboBox()
+        self.cbb_piezo_port.setMinimumWidth(80)
+        self.cbb_piezo_port.addItems(self._get_serial_ports())
+        control_layout.addWidget(self.cbb_piezo_port)
+
+        self.btn_piezo_refresh = QPushButton("刷新")
+        self.btn_piezo_refresh.setMaximumWidth(40)
+        self.btn_piezo_refresh.clicked.connect(self._refresh_piezo_ports)
+        control_layout.addWidget(self.btn_piezo_refresh)
+
+        self.cbb_piezo_channel = QComboBox()
+        self.cbb_piezo_channel.addItems([f"CH{i+1}" for i in range(8)])
+        self.cbb_piezo_channel.setCurrentIndex(0)
+        self.cbb_piezo_channel.currentIndexChanged.connect(self._on_piezo_channel_changed)
+        control_layout.addWidget(self.cbb_piezo_channel)
+
+        self.btn_piezo_connect = QPushButton("连接压电")
+        self.btn_piezo_connect.clicked.connect(self._toggle_piezo_connection)
+        control_layout.addWidget(self.btn_piezo_connect)
+
         control_layout.addStretch()
 
         control_group.setLayout(control_layout)
@@ -496,7 +680,32 @@ class VideoPointCloudPlayer(QMainWindow):
         ft_group.setLayout(ft_layout)
         main_splitter.addWidget(ft_group)
 
-        # 设置分割比例
+        # 下部：压电信号实时波形（PyQtGraph）
+        piezo_group = QGroupBox("压电信号实时波形")
+        piezo_layout = QVBoxLayout(piezo_group)
+        piezo_layout.setContentsMargins(4, 16, 4, 4)
+
+        self.piezo_plot_widget = pg.GraphicsLayoutWidget()
+        self.piezo_plot_widget.setBackground('w')
+        self.piezo_plot_item = self.piezo_plot_widget.addPlot()
+        self.piezo_plot_item.setLabel('left', '电压 (V)')
+        self.piezo_plot_item.setLabel('bottom', '采样点')
+        self.piezo_plot_item.setYRange(-3.3, 3.3)
+        self.piezo_plot_item.showGrid(x=True, y=True, alpha=0.3)
+        self.piezo_plot_item.addLegend(offset=(10, 10))
+        # 当前预览通道曲线（蓝色，粗）
+        self.piezo_curve_preview = self.piezo_plot_item.plot(
+            pen=pg.mkPen('#2196F3', width=2), name='预览通道')
+        # 状态标签（右上角显示通道名和采样率）
+        self.piezo_status_label = pg.LabelItem(
+            text='未连接', color='#666666', size='10pt')
+        self.piezo_plot_widget.addItem(self.piezo_status_label, row=0, col=1)
+
+        piezo_layout.addWidget(self.piezo_plot_widget)
+        main_splitter.addWidget(piezo_group)
+
+        # 分割比例：视觉区 5 : 力显示 1 : 压电波形 2
+        main_splitter.setSizes([500, 60, 160])
         main_layout.addWidget(main_splitter)
 
         # 状态栏
@@ -566,6 +775,77 @@ class VideoPointCloudPlayer(QMainWindow):
             self.lbl_ft_mx.setText(f"Mx: {ftv.mx:+.3f}")
             self.lbl_ft_my.setText(f"My: {ftv.my:+.3f}")
             self.lbl_ft_mz.setText(f"Mz: {ftv.mz:+.3f}")
+
+    # ---- 压电传感器 ----
+
+    @staticmethod
+    def _get_serial_ports():
+        """获取当前可用串口列表"""
+        try:
+            return [p.device for p in serial.tools.list_ports.comports()]
+        except Exception:
+            return []
+
+    def _refresh_piezo_ports(self):
+        """刷新串口下拉列表"""
+        current = self.cbb_piezo_port.currentText()
+        self.cbb_piezo_port.clear()
+        ports = self._get_serial_ports()
+        self.cbb_piezo_port.addItems(ports)
+        # 尽量保持原来选中的串口
+        if current in ports:
+            self.cbb_piezo_port.setCurrentText(current)
+
+    def _on_piezo_channel_changed(self, index):
+        """切换预览通道，通知采集线程（如果已连接）"""
+        self.piezo_preview_ch = index
+        if self.piezo_thread is not None:
+            self.piezo_thread.set_preview_channel(index)
+        ch_name = f"CH{index + 1}"
+        self.piezo_plot_item.setTitle(f"压电信号 — {ch_name}")
+
+    def _toggle_piezo_connection(self):
+        """连接/断开压电传感器"""
+        if self.piezo_thread is None or not self.piezo_thread.isRunning():
+            port = self.cbb_piezo_port.currentText()
+            if not port:
+                QMessageBox.warning(self, "警告", "请先选择压电串口")
+                return
+
+            self.piezo_thread = PiezoSerialThread(port, baudrate=921600, plot_interval=50)
+            self.piezo_thread.set_preview_channel(self.piezo_preview_ch)
+            # 只连接低频刷新信号，不走高频数据回调
+            self.piezo_thread.plot_ready.connect(self._refresh_piezo_plot)
+            self.piezo_thread.start()
+
+            self.btn_piezo_connect.setText("断开压电")
+            self.btn_piezo_connect.setStyleSheet("background-color: #ff7043; color: white;")
+            ch_name = f"CH{self.piezo_preview_ch + 1}"
+            self.piezo_plot_item.setTitle(f"压电信号 — {ch_name}")
+            self.piezo_status_label.setText(f'已连接 {port}')
+            self.status_bar.showMessage(f"压电传感器已连接: {port}，记录全部8通道")
+        else:
+            self.piezo_thread.stop()
+            self.piezo_thread = None
+            self.btn_piezo_connect.setText("连接压电")
+            self.btn_piezo_connect.setStyleSheet("")
+            self.piezo_status_label.setText('未连接')
+            self.piezo_curve_preview.setData([])
+            self.status_bar.showMessage("压电传感器已断开")
+
+    def _refresh_piezo_plot(self):
+        """由低频 plot_ready 信号触发，刷新波形（约5-10Hz，不影响视觉帧率）"""
+        if self.piezo_thread is None:
+            return
+        y = self.piezo_thread.get_plot_data()
+        if len(y) == 0:
+            return
+        self.piezo_curve_preview.setData(y)
+        # 更新状态标签：显示缓冲区大小
+        with self.piezo_thread._buf_lock:
+            n = len(self.piezo_thread._shared_buf)
+        self.piezo_status_label.setText(
+            f'CH{self.piezo_preview_ch + 1}  |  缓冲: {n} 帧')
 
     def save_input_config(self):
         """保存当前输入源配置到文件"""
@@ -1274,10 +1554,18 @@ class VideoPointCloudPlayer(QMainWindow):
 
         self.recording_buffer = {'timestamps': [], 'xyz': [], 'abnormal': []}
         self.ft_recording_buffer = {'timestamps': [], 'ft_values': []}
+
+        # 清空压电缓冲区，记录采集起始时间
+        if self.piezo_thread is not None:
+            self.piezo_thread.clear_buffer()
+        self._piezo_record_start_ts = time.time()
+
         self.is_recording = True
         self.btn_record.setText("停止采集")
         self.btn_record.setStyleSheet("background-color: #ff4444; color: white;")
-        self.status_bar.showMessage("数据采集中...")
+        has_piezo = self.piezo_thread is not None and self.piezo_thread.isRunning()
+        self.status_bar.showMessage(
+            f"数据采集中... {'(含压电8通道)' if has_piezo else '(无压电，可连接后再采集)'}")
 
     def stop_recording(self):
         """停止数据采集并保存HDF5"""
@@ -1326,6 +1614,17 @@ class VideoPointCloudPlayer(QMainWindow):
         N = xyz_ref.shape[0]
         point_id = np.arange(N, dtype=np.int32)
 
+        # 获取压电数据快照（采集期间的全部8通道原始数据）
+        piezo_ts = None
+        piezo_vals = None
+        if self.piezo_thread is not None:
+            piezo_ts_raw, piezo_vals_raw = self.piezo_thread.get_recording_snapshot()
+            if len(piezo_ts_raw) > 0:
+                # 只保留采集开始之后的数据
+                mask = piezo_ts_raw >= self._piezo_record_start_ts
+                piezo_ts = piezo_ts_raw[mask]
+                piezo_vals = piezo_vals_raw[mask]  # (M, 8)
+
         # 时间戳自动命名，保存到代码同级目录下的 force_calibration 文件夹
         filename = f"calibration_{stop_time.strftime('%Y%m%d_%H%M%S')}.h5"
         save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
@@ -1340,7 +1639,7 @@ class VideoPointCloudPlayer(QMainWindow):
                 vision.create_dataset('xyz', data=xyz_all)
                 vision.create_dataset('dxyz', data=dxyz)
                 vision.create_dataset('point_id', data=point_id)
-                vision.create_dataset('abnormal', data=abnormal)  # 异常帧标记
+                vision.create_dataset('abnormal', data=abnormal)
 
                 # /reference
                 ref = f.create_group('reference')
@@ -1351,13 +1650,31 @@ class VideoPointCloudPlayer(QMainWindow):
                 meta.attrs['camera_fps'] = self.spin_speed.value()
                 meta.attrs['marker_count'] = N
                 meta.attrs['experiment_name'] = filename
+                meta.attrs['has_piezo'] = (piezo_ts is not None and len(piezo_ts) > 0)
 
                 # /force（预留扩展位置）
                 f.create_group('force')
 
+                # /piezo（全部8通道原始数据）
+                if piezo_ts is not None and len(piezo_ts) > 0:
+                    pg_grp = f.create_group('piezo')
+                    pg_grp.create_dataset('timestamp', data=piezo_ts)
+                    pg_grp.create_dataset('values', data=piezo_vals)  # (M, 8)
+                    pg_grp.attrs['n_channels'] = 8
+                    pg_grp.attrs['channel_names'] = 'CH1,CH2,CH3,CH4,CH5,CH6,CH7,CH8'
+                    pg_grp.attrs['unit'] = 'V'
+                    if len(piezo_ts) > 1:
+                        dur = piezo_ts[-1] - piezo_ts[0]
+                        rate = (len(piezo_ts) - 1) / dur if dur > 0 else 0
+                        pg_grp.attrs['sample_rate_hz'] = round(rate, 1)
+
             self.recording_buffer = {'timestamps': [], 'xyz': [], 'abnormal': []}
+
+            piezo_info = ""
+            if piezo_ts is not None and len(piezo_ts) > 0:
+                piezo_info = f"\n压电采样: {len(piezo_ts)} 点 × 8通道"
             QMessageBox.information(self, "保存成功",
-                f"数据已保存到:\n{filepath}\n\n帧数: {len(timestamps)}\nMarker数: {N}")
+                f"数据已保存到:\n{filepath}\n\n帧数: {len(timestamps)}\nMarker数: {N}{piezo_info}")
             self.status_bar.showMessage(f"采集完成，已保存 {len(timestamps)} 帧到 {filename}")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", f"写入HDF5文件失败:\n{e}")
@@ -2170,6 +2487,10 @@ class VideoPointCloudPlayer(QMainWindow):
         self.ft_display_timer.stop()
         # 停止播放定时器
         self.play_timer.stop()
+        # 停止压电传感器线程
+        if self.piezo_thread is not None:
+            self.piezo_thread.stop()
+            self.piezo_thread = None
         # 关闭力传感器订阅
         if self.ft_node is not None:
             # 先清除订阅引用，阻止回调继续触发

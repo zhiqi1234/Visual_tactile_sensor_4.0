@@ -57,7 +57,9 @@ plt.rcParams['axes.unicode_minus'] = False
 
 class PiezoSerialThread(QThread):
     """压电传感器串口采集线程（从Tactile_Finger.py移植）"""
-    data_received = pyqtSignal(int, list, float)  # (adc_group, voltage_list, timestamp)
+    # 不再用 pyqtSignal 高频发射，改为直接写共享缓冲区
+    # 只在需要刷新波形时发射低频信号
+    plot_ready = pyqtSignal()
 
     def __init__(self, port='COM1', baudrate=921600):
         super().__init__()
@@ -67,6 +69,37 @@ class PiezoSerialThread(QThread):
         self.running = False
         self.buffer = b''
         self.last_clear_time = 0
+
+        # 共享缓冲区：线程直接写，主线程只读
+        # 使用 deque + lock 保证线程安全
+        self._shared_buf = deque(maxlen=2000)  # (timestamp, voltage)
+        self._buf_lock = threading.Lock()
+        self._selected_channel = 0  # 主线程可随时修改
+
+        # 波形刷新节流：每积累N帧才发一次信号
+        self._plot_counter = 0
+        self._plot_interval = 50  # 每50帧发一次信号（约5-10Hz刷新）
+
+    def set_channel(self, ch):
+        """主线程调用，切换通道（无需加锁，int赋值是原子的）"""
+        self._selected_channel = ch
+
+    def get_buffer_snapshot(self):
+        """主线程调用，获取缓冲区快照（用于波形显示）"""
+        with self._buf_lock:
+            return list(self._shared_buf)
+
+    def get_window_values(self, t_start, t_end):
+        """主线程调用，获取时间窗口内的电压值（用于特征提取）"""
+        with self._buf_lock:
+            # deque 是有序的，从右端（最新）往左找，遇到超出范围就停
+            result = []
+            for t, v in reversed(self._shared_buf):
+                if t < t_start:
+                    break
+                if t <= t_end:
+                    result.append(v)
+        return result
 
     def run(self):
         try:
@@ -85,6 +118,9 @@ class PiezoSerialThread(QThread):
                         self.last_clear_time = current_time
 
                     self.process_data()
+                else:
+                    # 没有数据时短暂休眠，避免空转占满CPU
+                    time.sleep(0.0005)
         except serial.SerialException as e:
             print(f"压电串口错误: {e}")
 
@@ -111,17 +147,26 @@ class PiezoSerialThread(QThread):
                     flag_adc = group_data[0]
                     data_frame = group_data[1:]
 
-                    voltages = []
-                    for i in range(0, len(data_frame), 3):
-                        value = data_frame[i:i + 3]
-                        decimal_value = self.bytes_to_decimal(value)
+                    # 只解析选中通道，避免解析全部8通道
+                    ch = self._selected_channel
+                    offset = ch * 3
+                    if offset + 3 <= len(data_frame):
+                        raw = data_frame[offset:offset + 3]
+                        decimal_value = self.bytes_to_decimal(raw)
                         voltage = (decimal_value / MAX_VALUE) * REFERENCE_VOLTAGE
-                        channel_index = i // 3
-                        if channel_index == 0 or channel_index == 1:
+                        if ch == 0 or ch == 1:
                             voltage = -voltage
-                        voltages.append(voltage)
 
-                    self.data_received.emit(flag_adc, voltages, time.time())
+                        ts = time.time()
+                        with self._buf_lock:
+                            self._shared_buf.append((ts, voltage))
+
+                        # 节流：每 _plot_interval 帧发一次刷新信号
+                        self._plot_counter += 1
+                        if self._plot_counter >= self._plot_interval:
+                            self._plot_counter = 0
+                            self.plot_ready.emit()
+
                     self.buffer = self.buffer[aaaa_index + FRAME_LENGTH:]
                 else:
                     self.buffer = self.buffer[aaaa_index + 2:]
@@ -441,9 +486,8 @@ class V7MainWindow(QMainWindow):
         # 压电传感器相关
         self.piezo_thread = None
         self.piezo_channel = 0  # 选择的通道（0-7）
-        self.piezo_buffer = deque(maxlen=2000)  # 环形缓冲区：(timestamp, voltage)
         self.piezo_window_ms = 33  # 时间窗口（毫秒）
-        self.piezo_lock = threading.Lock()
+        # 注意：缓冲区和锁现在由 PiezoSerialThread 内部管理，主窗口不再持有
 
         # 六维力传感器
         self.ft_node = None
@@ -569,7 +613,7 @@ class V7MainWindow(QMainWindow):
 
         self.cbb_piezo_channel = QComboBox()
         self.cbb_piezo_channel.addItems([f"CH{i+1}" for i in range(8)])
-        self.cbb_piezo_channel.currentIndexChanged.connect(lambda i: setattr(self, 'piezo_channel', i))
+        self.cbb_piezo_channel.currentIndexChanged.connect(self._on_piezo_channel_changed)
 
         self.btn_piezo_connect = QPushButton("连接压电")
         self.btn_piezo_connect.clicked.connect(self.toggle_piezo_connection)
@@ -681,6 +725,12 @@ class V7MainWindow(QMainWindow):
         except Exception:
             return []
 
+    def _on_piezo_channel_changed(self, index):
+        """通道切换：同步通知采集线程，无需主线程介入数据流"""
+        self.piezo_channel = index
+        if self.piezo_thread is not None:
+            self.piezo_thread.set_channel(index)
+
     def toggle_piezo_connection(self):
         """切换压电传感器连接状态"""
         if self.piezo_thread is None or not self.piezo_thread.isRunning():
@@ -690,7 +740,9 @@ class V7MainWindow(QMainWindow):
                 return
 
             self.piezo_thread = PiezoSerialThread(port, 921600)
-            self.piezo_thread.data_received.connect(self.on_piezo_data)
+            self.piezo_thread.set_channel(self.piezo_channel)
+            # 只连接低频的 plot_ready 信号，不连接高频数据信号
+            self.piezo_thread.plot_ready.connect(self._update_piezo_plot)
             self.piezo_thread.start()
 
             self.btn_piezo_connect.setText("断开压电")
@@ -702,57 +754,47 @@ class V7MainWindow(QMainWindow):
             self.status_bar.showMessage("压电传感器已断开")
 
     def on_piezo_data(self, adc_group, voltages, timestamp):
-        """压电数据回调"""
-        selected_ch = self.piezo_channel
-        if selected_ch < len(voltages):
-            with self.piezo_lock:
-                self.piezo_buffer.append((timestamp, voltages[selected_ch]))
-
-        # 每20次更新一次波形（降低刷新频率）
-        if not hasattr(self, '_piezo_update_counter'):
-            self._piezo_update_counter = 0
-        self._piezo_update_counter += 1
-        if self._piezo_update_counter >= 20:
-            self._piezo_update_counter = 0
-            self._update_piezo_plot()
+        """此方法已废弃，保留仅为兼容性"""
+        pass
 
     def _update_piezo_plot(self):
-        """更新压电波形显示"""
-        with self.piezo_lock:
-            buf = list(self.piezo_buffer)
-
+        """更新压电波形显示（由低频 plot_ready 信号触发，约5-10Hz）"""
+        if self.piezo_thread is None:
+            return
+        buf = self.piezo_thread.get_buffer_snapshot()
         if len(buf) == 0:
             return
-
-        y_data = [v for _, v in buf[-2000:]]
-        x_data = list(range(len(y_data)))
-        self.piezo_curve.setData(x_data, y_data)
+        y_data = [v for _, v in buf]
+        self.piezo_curve.setData(y_data)
 
     def extract_realtime_piezo_features(self, current_timestamp=None):
-        """从环形缓冲区提取最新时间窗口的统计特征
+        """从采集线程的缓冲区提取最新时间窗口的统计特征
 
         Returns:
             np.ndarray, shape (5,): [mean, std, rms, max, energy]
         """
+        if self.piezo_thread is None:
+            return np.zeros(5, dtype=np.float32)
+
         if current_timestamp is None:
             current_timestamp = time.time()
 
         window_sec = self.piezo_window_ms / 1000.0
         t_start = current_timestamp - window_sec
 
-        with self.piezo_lock:
-            window_vals = [v for t, v in self.piezo_buffer if t_start <= t <= current_timestamp]
+        # 直接调用线程的高效查询方法（从右端反向遍历，早停）
+        window_vals = self.piezo_thread.get_window_values(t_start, current_timestamp)
 
         if len(window_vals) == 0:
             return np.zeros(5, dtype=np.float32)
 
-        window_vals = np.array(window_vals, dtype=np.float32)
+        arr = np.array(window_vals, dtype=np.float32)
         return np.array([
-            np.mean(window_vals),
-            np.std(window_vals),
-            np.sqrt(np.mean(window_vals ** 2)),
-            np.max(np.abs(window_vals)),
-            np.sum(np.abs(window_vals))
+            np.mean(arr),
+            np.std(arr),
+            np.sqrt(np.mean(arr ** 2)),
+            np.max(np.abs(arr)),
+            np.sum(np.abs(arr))
         ], dtype=np.float32)
 
     # ──────────────────── 六维力传感器 ────────────────────

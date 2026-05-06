@@ -581,9 +581,18 @@ class HDF5Viewer(QMainWindow):
                     piezo_grp = f['piezo']
                     if 'timestamp' in piezo_grp and 'values' in piezo_grp:
                         self.piezo_data['timestamp'] = piezo_grp['timestamp'][:]
-                        self.piezo_data['values'] = piezo_grp['values'][:]
+                        raw_vals = piezo_grp['values'][:]  # (M,) 或 (M, 8)
+                        self.piezo_data['raw_values'] = raw_vals  # 保留全部通道
+                        # 默认取第0通道（CH1）用于显示
+                        if raw_vals.ndim == 2:
+                            self.piezo_data['values'] = raw_vals[:, self.piezo_channel]
+                            self.piezo_data['n_channels'] = raw_vals.shape[1]
+                        else:
+                            self.piezo_data['values'] = raw_vals
+                            self.piezo_data['n_channels'] = 1
                         self.piezo_data['channel'] = int(piezo_grp.attrs.get('channel', 1))
-                        print(f"已加载压电数据: {len(self.piezo_data['timestamp'])} 采样, 通道 CH{self.piezo_data['channel']}")
+                        print(f"已加载压电数据: {len(self.piezo_data['timestamp'])} 采样, "
+                              f"{self.piezo_data['n_channels']} 通道")
         except Exception as e:
             self.statusBar().showMessage(f"读取力觉文件失败: {e}")
             return
@@ -1551,8 +1560,15 @@ class HDF5Viewer(QMainWindow):
     #  压电信号相关方法
     # ──────────────────────────────────────────────
     def _on_piezo_channel_changed(self, index):
-        """压电通道切换"""
+        """压电通道切换：从已加载的8通道原始数据中取对应列"""
         self.piezo_channel = index
+        # 如果已加载多通道原始数据，切换显示列
+        if self.piezo_data and 'raw_values' in self.piezo_data:
+            raw = self.piezo_data['raw_values']
+            if raw.ndim == 2 and index < raw.shape[1]:
+                self.piezo_data['values'] = raw[:, index]
+            elif raw.ndim == 1:
+                self.piezo_data['values'] = raw
         self.update_piezo_plot()
 
     def _on_piezo_window_changed(self, value):
@@ -1720,7 +1736,15 @@ class HDF5Viewer(QMainWindow):
                 # 提取并保存压电特征（如果有压电数据）
                 if self.piezo_data:
                     piezo_ts = self.piezo_data['timestamp']
-                    piezo_vals = self.piezo_data['values']
+                    # 使用当前选中通道的数据
+                    if 'raw_values' in self.piezo_data:
+                        raw = self.piezo_data['raw_values']
+                        if raw.ndim == 2 and self.piezo_channel < raw.shape[1]:
+                            piezo_vals = raw[:, self.piezo_channel]
+                        else:
+                            piezo_vals = self.piezo_data['values']
+                    else:
+                        piezo_vals = self.piezo_data['values']
                     window_ms = self.piezo_window_ms
 
                     piezo_features = []
