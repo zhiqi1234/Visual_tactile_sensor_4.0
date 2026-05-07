@@ -8,7 +8,7 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 # --- 配置部分 ---
-CAMERA_INDEX = 1 
+CAMERA_INDEX = 2 
 SAVE_DIR_LEFT = 'calibration_left'
 SAVE_DIR_RIGHT = 'calibration_right'
 
@@ -30,14 +30,11 @@ class VideoThread(QThread):
             ret, cv_img = cap.read()
             if ret:
                 # ---------------------------------------------------------
-                # 修改点：将之前的垂直翻转改为旋转 180 度
+                # 修改点：默认不旋转摄像头图像
+                # 如需旋转180度，取消下面的注释
                 # ---------------------------------------------------------
-                
-                # 方法一：使用 rotate 函数 (推荐，语义清晰)
-                cv_img = cv2.rotate(cv_img, cv2.ROTATE_180)
-                
-                # 方法二：使用 flip 函数 (-1 代表同时水平和垂直翻转，数学上等于旋转180)
-                # cv_img = cv2.flip(cv_img, -1)
+
+                # cv_img = cv2.rotate(cv_img, cv2.ROTATE_180)
                 
                 self.change_pixmap_signal.emit(cv_img)
             else:
@@ -55,7 +52,7 @@ class App(QWidget):
         super().__init__()
         
         # 修改点：更新标题以匹配当前逻辑
-        self.setWindowTitle("双目镜面标定采集工具 (已旋转180°)")
+        self.setWindowTitle("双目镜面标定采集工具")
         self.resize(1920, 1080)
         self.disply_width = 1920
         self.display_height = 1080

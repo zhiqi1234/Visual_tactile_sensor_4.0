@@ -50,7 +50,7 @@ import pyqtgraph as pg
 class PiezoSerialThread(QThread):
     """压电传感器串口采集线程
     - 采集线程内部维护缓冲区，不通过高频 signal 打断主线程
-    - 保存全部8通道原始数据，供后续任意选通道分析
+    - 按ADC组(0-4)分别存储，供主线程按组选择显示/保存
     - 每积累 plot_interval 帧才发一次低频 plot_ready 信号刷新波形
     """
     plot_ready = pyqtSignal()  # 低频刷新信号，约5-10Hz
@@ -59,6 +59,7 @@ class PiezoSerialThread(QThread):
     _FRAME_LEN = 29
     _REF_V = 3.3
     _MAX_VAL = 2 ** 23
+    _N_GROUPS = 5
 
     def __init__(self, port='COM1', baudrate=921600, plot_interval=50):
         super().__init__()
@@ -69,11 +70,12 @@ class PiezoSerialThread(QThread):
         self._rx_buf = b''
         self._last_clear_time = 0
 
-        # 共享缓冲区：(timestamp, ch0, ch1, ..., ch7)，线程写，主线程读
-        self._shared_buf = deque(maxlen=3000)
+        # 按ADC组分组的共享缓冲区：5组，每行 (timestamp, ch0..ch7)
+        self._group_bufs = [deque(maxlen=3000) for _ in range(self._N_GROUPS)]
         self._buf_lock = threading.Lock()
 
-        # 波形显示用：当前预览通道（主线程可随时改，int赋值原子安全）
+        # 当前选中的ADC组和预览通道（主线程可随时改，int赋值原子安全）
+        self._selected_adc_group = 0
         self._preview_ch = 0
 
         # 节流计数
@@ -82,28 +84,32 @@ class PiezoSerialThread(QThread):
 
     # ── 主线程调用的接口 ──────────────────────────────────
 
+    def set_adc_group(self, group):
+        """切换ADC组（0-4），无需加锁"""
+        self._selected_adc_group = max(0, min(self._N_GROUPS - 1, group))
+
     def set_preview_channel(self, ch):
         """切换波形预览通道（0-7），无需加锁"""
         self._preview_ch = max(0, min(7, ch))
 
     def get_plot_data(self):
-        """获取当前预览通道的波形数据（用于 PyQtGraph 刷新）
+        """获取当前选中ADC组、预览通道的波形数据（用于 PyQtGraph 刷新）
         返回 np.ndarray 电压序列，最多2000点
         """
         with self._buf_lock:
-            buf = list(self._shared_buf)
+            buf = list(self._group_bufs[self._selected_adc_group])
         if not buf:
             return np.array([], dtype=np.float32)
         ch = self._preview_ch + 1  # buf 每行: (ts, ch0..ch7)，索引+1
         return np.array([row[ch] for row in buf[-2000:]], dtype=np.float32)
 
     def get_recording_snapshot(self):
-        """获取完整缓冲区快照用于保存（返回 timestamps 和 all_channels）
+        """获取当前选中ADC组的完整缓冲区快照用于保存
         timestamps: (N,) float64
         values:     (N, 8) float32
         """
         with self._buf_lock:
-            buf = list(self._shared_buf)
+            buf = list(self._group_bufs[self._selected_adc_group])
         if not buf:
             return np.array([], dtype=np.float64), np.zeros((0, 8), dtype=np.float32)
         timestamps = np.array([row[0] for row in buf], dtype=np.float64)
@@ -111,9 +117,10 @@ class PiezoSerialThread(QThread):
         return timestamps, values
 
     def clear_buffer(self):
-        """采集开始时清空缓冲区"""
+        """采集开始时清空所有ADC组缓冲区"""
         with self._buf_lock:
-            self._shared_buf.clear()
+            for buf in self._group_bufs:
+                buf.clear()
 
     # ── 线程主循环 ────────────────────────────────────────
 
@@ -164,6 +171,9 @@ class PiezoSerialThread(QThread):
             self._rx_buf = self._rx_buf[idx + self._FRAME_LEN:]
 
             # payload[0] = ADC组标识（0-4），payload[1:] = 8通道×3字节
+            adc_group = payload[0]
+            if adc_group >= self._N_GROUPS:
+                continue
             data_bytes = payload[1:]
             if len(data_bytes) < 24:
                 continue
@@ -179,7 +189,7 @@ class PiezoSerialThread(QThread):
                 voltages.append(v)
 
             with self._buf_lock:
-                self._shared_buf.append((ts, *voltages))  # (ts, v0..v7)
+                self._group_bufs[adc_group].append((ts, *voltages))  # (ts, v0..v7)
 
             # 节流：每 _plot_interval 帧发一次刷新信号
             self._plot_counter += 1
@@ -221,6 +231,7 @@ class CameraThread(QThread):
             ret, frame = self.video_cap.read()
             if ret:
                 capture_timestamp = time.time()
+                # 默认不旋转，如需旋转180度请在GUI中勾选
                 if self.rotate_180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
                 self.frame_signal.emit(frame, capture_timestamp)
@@ -511,6 +522,7 @@ class VideoPointCloudPlayer(QMainWindow):
         # 压电传感器相关
         self.piezo_thread = None          # PiezoSerialThread 实例
         self.piezo_preview_ch = 0         # 当前波形预览通道（0-7）
+        self.piezo_adc_group = 0          # 当前选中ADC组（0-4）
         # 采集时记录的起始时间戳，用于截取本次采集段
         self._piezo_record_start_ts = 0.0
 
@@ -576,7 +588,7 @@ class VideoPointCloudPlayer(QMainWindow):
         self.spin_camera_idx.setPrefix("ID: ")
 
         self.chk_rotate = QCheckBox("旋转180°")
-        self.chk_rotate.setChecked(True)
+        self.chk_rotate.setChecked(False)
 
         control_layout.addWidget(self.btn_select_input)
         control_layout.addWidget(self.btn_play_pause)
@@ -608,6 +620,12 @@ class VideoPointCloudPlayer(QMainWindow):
         self.cbb_piezo_channel.setCurrentIndex(0)
         self.cbb_piezo_channel.currentIndexChanged.connect(self._on_piezo_channel_changed)
         control_layout.addWidget(self.cbb_piezo_channel)
+
+        self.cbb_piezo_adc_group = QComboBox()
+        self.cbb_piezo_adc_group.addItems([f"ADC{i+1}" for i in range(5)])
+        self.cbb_piezo_adc_group.setCurrentIndex(0)
+        self.cbb_piezo_adc_group.currentIndexChanged.connect(self._on_piezo_adc_group_changed)
+        control_layout.addWidget(self.cbb_piezo_adc_group)
 
         self.btn_piezo_connect = QPushButton("连接压电")
         self.btn_piezo_connect.clicked.connect(self._toggle_piezo_connection)
@@ -802,7 +820,15 @@ class VideoPointCloudPlayer(QMainWindow):
         if self.piezo_thread is not None:
             self.piezo_thread.set_preview_channel(index)
         ch_name = f"CH{index + 1}"
-        self.piezo_plot_item.setTitle(f"压电信号 — {ch_name}")
+        self.piezo_plot_item.setTitle(f"压电信号 — ADC{self.piezo_adc_group + 1} {ch_name}")
+
+    def _on_piezo_adc_group_changed(self, index):
+        """切换ADC组，通知采集线程（如果已连接）"""
+        self.piezo_adc_group = index
+        if self.piezo_thread is not None:
+            self.piezo_thread.set_adc_group(index)
+        ch_name = f"CH{self.piezo_preview_ch + 1}"
+        self.piezo_plot_item.setTitle(f"压电信号 — ADC{index + 1} {ch_name}")
 
     def _toggle_piezo_connection(self):
         """连接/断开压电传感器"""
@@ -814,6 +840,7 @@ class VideoPointCloudPlayer(QMainWindow):
 
             self.piezo_thread = PiezoSerialThread(port, baudrate=921600, plot_interval=50)
             self.piezo_thread.set_preview_channel(self.piezo_preview_ch)
+            self.piezo_thread.set_adc_group(self.piezo_adc_group)
             # 只连接低频刷新信号，不走高频数据回调
             self.piezo_thread.plot_ready.connect(self._refresh_piezo_plot)
             self.piezo_thread.start()
@@ -821,7 +848,7 @@ class VideoPointCloudPlayer(QMainWindow):
             self.btn_piezo_connect.setText("断开压电")
             self.btn_piezo_connect.setStyleSheet("background-color: #ff7043; color: white;")
             ch_name = f"CH{self.piezo_preview_ch + 1}"
-            self.piezo_plot_item.setTitle(f"压电信号 — {ch_name}")
+            self.piezo_plot_item.setTitle(f"压电信号 — ADC{self.piezo_adc_group + 1} {ch_name}")
             self.piezo_status_label.setText(f'已连接 {port}')
             self.status_bar.showMessage(f"压电传感器已连接: {port}，记录全部8通道")
         else:
@@ -843,9 +870,9 @@ class VideoPointCloudPlayer(QMainWindow):
         self.piezo_curve_preview.setData(y)
         # 更新状态标签：显示缓冲区大小
         with self.piezo_thread._buf_lock:
-            n = len(self.piezo_thread._shared_buf)
+            n = len(self.piezo_thread._group_bufs[self.piezo_thread._selected_adc_group])
         self.piezo_status_label.setText(
-            f'CH{self.piezo_preview_ch + 1}  |  缓冲: {n} 帧')
+            f'ADC{self.piezo_adc_group + 1} CH{self.piezo_preview_ch + 1}  |  缓冲: {n} 帧')
 
     def save_input_config(self):
         """保存当前输入源配置到文件"""
@@ -1655,13 +1682,14 @@ class VideoPointCloudPlayer(QMainWindow):
                 # /force（预留扩展位置）
                 f.create_group('force')
 
-                # /piezo（全部8通道原始数据）
+                # /piezo（当前选中ADC组的全部8通道原始数据）
                 if piezo_ts is not None and len(piezo_ts) > 0:
                     pg_grp = f.create_group('piezo')
                     pg_grp.create_dataset('timestamp', data=piezo_ts)
                     pg_grp.create_dataset('values', data=piezo_vals)  # (M, 8)
                     pg_grp.attrs['n_channels'] = 8
                     pg_grp.attrs['channel_names'] = 'CH1,CH2,CH3,CH4,CH5,CH6,CH7,CH8'
+                    pg_grp.attrs['adc_group'] = self.piezo_adc_group + 1
                     pg_grp.attrs['unit'] = 'V'
                     if len(piezo_ts) > 1:
                         dur = piezo_ts[-1] - piezo_ts[0]

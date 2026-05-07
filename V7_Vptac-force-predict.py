@@ -57,9 +57,12 @@ plt.rcParams['axes.unicode_minus'] = False
 
 class PiezoSerialThread(QThread):
     """压电传感器串口采集线程（从Tactile_Finger.py移植）"""
-    # 不再用 pyqtSignal 高频发射，改为直接写共享缓冲区
-    # 只在需要刷新波形时发射低频信号
     plot_ready = pyqtSignal()
+
+    _FRAME_LEN = 29
+    _REF_V = 3.3
+    _MAX_VAL = 2 ** 23
+    _N_GROUPS = 5
 
     def __init__(self, port='COM1', baudrate=921600):
         super().__init__()
@@ -70,31 +73,33 @@ class PiezoSerialThread(QThread):
         self.buffer = b''
         self.last_clear_time = 0
 
-        # 共享缓冲区：线程直接写，主线程只读
-        # 使用 deque + lock 保证线程安全
-        self._shared_buf = deque(maxlen=2000)  # (timestamp, voltage)
+        # 按ADC组(0-4)分组的共享缓冲区，每行 (timestamp, voltage)
+        self._group_bufs = [deque(maxlen=2000) for _ in range(self._N_GROUPS)]
         self._buf_lock = threading.Lock()
-        self._selected_channel = 0  # 主线程可随时修改
+        self._selected_adc_group = 0  # 当前选中ADC组
+        self._selected_channel = 0   # 当前选中通道
 
-        # 波形刷新节流：每积累N帧才发一次信号
         self._plot_counter = 0
-        self._plot_interval = 50  # 每50帧发一次信号（约5-10Hz刷新）
+        self._plot_interval = 50
 
     def set_channel(self, ch):
-        """主线程调用，切换通道（无需加锁，int赋值是原子的）"""
+        """主线程调用，切换通道（0-7）"""
         self._selected_channel = ch
 
+    def set_adc_group(self, group):
+        """主线程调用，切换ADC组（0-4）"""
+        self._selected_adc_group = max(0, min(self._N_GROUPS - 1, group))
+
     def get_buffer_snapshot(self):
-        """主线程调用，获取缓冲区快照（用于波形显示）"""
+        """获取当前选中ADC组的波形数据（用于波形显示）"""
         with self._buf_lock:
-            return list(self._shared_buf)
+            return list(self._group_bufs[self._selected_adc_group])
 
     def get_window_values(self, t_start, t_end):
-        """主线程调用，获取时间窗口内的电压值（用于特征提取）"""
+        """获取当前选中ADC组时间窗口内的电压值（用于特征提取）"""
         with self._buf_lock:
-            # deque 是有序的，从右端（最新）往左找，遇到超出范围就停
             result = []
-            for t, v in reversed(self._shared_buf):
+            for t, v in reversed(self._group_bufs[self._selected_adc_group]):
                 if t < t_start:
                     break
                 if t <= t_end:
@@ -133,8 +138,6 @@ class PiezoSerialThread(QThread):
 
     def process_data(self):
         FRAME_LENGTH = 29
-        REFERENCE_VOLTAGE = 3.3
-        MAX_VALUE = 2 ** 23
 
         while True:
             aaaa_index = self.buffer.find(b'\xaa\xaa')
@@ -147,25 +150,26 @@ class PiezoSerialThread(QThread):
                     flag_adc = group_data[0]
                     data_frame = group_data[1:]
 
-                    # 只解析选中通道，避免解析全部8通道
-                    ch = self._selected_channel
-                    offset = ch * 3
-                    if offset + 3 <= len(data_frame):
-                        raw = data_frame[offset:offset + 3]
-                        decimal_value = self.bytes_to_decimal(raw)
-                        voltage = (decimal_value / MAX_VALUE) * REFERENCE_VOLTAGE
-                        if ch == 0 or ch == 1:
-                            voltage = -voltage
+                    if flag_adc < self._N_GROUPS:
+                        ch = self._selected_channel
+                        offset = ch * 3
+                        if offset + 3 <= len(data_frame):
+                            raw = data_frame[offset:offset + 3]
+                            decimal_value = self.bytes_to_decimal(raw)
+                            voltage = (decimal_value / self._MAX_VAL) * self._REF_V
+                            if ch == 0 or ch == 1:
+                                voltage = -voltage
 
-                        ts = time.time()
-                        with self._buf_lock:
-                            self._shared_buf.append((ts, voltage))
+                            ts = time.time()
+                            with self._buf_lock:
+                                self._group_bufs[flag_adc].append((ts, voltage))
 
-                        # 节流：每 _plot_interval 帧发一次刷新信号
-                        self._plot_counter += 1
-                        if self._plot_counter >= self._plot_interval:
-                            self._plot_counter = 0
-                            self.plot_ready.emit()
+                            # 只对选中ADC组计数节流
+                            if flag_adc == self._selected_adc_group:
+                                self._plot_counter += 1
+                                if self._plot_counter >= self._plot_interval:
+                                    self._plot_counter = 0
+                                    self.plot_ready.emit()
 
                     self.buffer = self.buffer[aaaa_index + FRAME_LENGTH:]
                 else:
@@ -207,6 +211,7 @@ class CameraThread(QThread):
             ret, frame = self.video_cap.read()
             if ret:
                 capture_timestamp = time.time()
+                # 默认不旋转，如需旋转180度请在GUI中勾选
                 if self.rotate_180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
                 self.frame_signal.emit(frame, capture_timestamp)
@@ -485,9 +490,9 @@ class V7MainWindow(QMainWindow):
 
         # 压电传感器相关
         self.piezo_thread = None
-        self.piezo_channel = 0  # 选择的通道（0-7）
+        self.piezo_channel = 0    # 选择的通道（0-7）
+        self.piezo_adc_group = 0  # 选择的ADC组（0-4）
         self.piezo_window_ms = 33  # 时间窗口（毫秒）
-        # 注意：缓冲区和锁现在由 PiezoSerialThread 内部管理，主窗口不再持有
 
         # 六维力传感器
         self.ft_node = None
@@ -597,7 +602,7 @@ class V7MainWindow(QMainWindow):
         self.spin_camera_idx.setPrefix("ID: ")
 
         self.chk_rotate = QCheckBox("旋转180°")
-        self.chk_rotate.setChecked(True)
+        self.chk_rotate.setChecked(False)
 
         for w in [self.btn_select_input, self.btn_load_h5, self.btn_play_pause, self.btn_reset,
                   self.btn_set_as_base, self.btn_record, self.lbl_frame_info,
@@ -615,10 +620,15 @@ class V7MainWindow(QMainWindow):
         self.cbb_piezo_channel.addItems([f"CH{i+1}" for i in range(8)])
         self.cbb_piezo_channel.currentIndexChanged.connect(self._on_piezo_channel_changed)
 
+        self.cbb_piezo_adc_group = QComboBox()
+        self.cbb_piezo_adc_group.addItems([f"ADC{i+1}" for i in range(5)])
+        self.cbb_piezo_adc_group.currentIndexChanged.connect(self._on_piezo_adc_group_changed)
+
         self.btn_piezo_connect = QPushButton("连接压电")
         self.btn_piezo_connect.clicked.connect(self.toggle_piezo_connection)
 
-        for w in [lbl_piezo, self.cbb_piezo_port, self.cbb_piezo_channel, self.btn_piezo_connect]:
+        for w in [lbl_piezo, self.cbb_piezo_port, self.cbb_piezo_channel,
+                  self.cbb_piezo_adc_group, self.btn_piezo_connect]:
             control_layout.addWidget(w)
 
         control_layout.addStretch()
@@ -726,10 +736,16 @@ class V7MainWindow(QMainWindow):
             return []
 
     def _on_piezo_channel_changed(self, index):
-        """通道切换：同步通知采集线程，无需主线程介入数据流"""
+        """通道切换：同步通知采集线程"""
         self.piezo_channel = index
         if self.piezo_thread is not None:
             self.piezo_thread.set_channel(index)
+
+    def _on_piezo_adc_group_changed(self, index):
+        """ADC组切换：同步通知采集线程"""
+        self.piezo_adc_group = index
+        if self.piezo_thread is not None:
+            self.piezo_thread.set_adc_group(index)
 
     def toggle_piezo_connection(self):
         """切换压电传感器连接状态"""
@@ -741,12 +757,13 @@ class V7MainWindow(QMainWindow):
 
             self.piezo_thread = PiezoSerialThread(port, 921600)
             self.piezo_thread.set_channel(self.piezo_channel)
+            self.piezo_thread.set_adc_group(self.piezo_adc_group)
             # 只连接低频的 plot_ready 信号，不连接高频数据信号
             self.piezo_thread.plot_ready.connect(self._update_piezo_plot)
             self.piezo_thread.start()
 
             self.btn_piezo_connect.setText("断开压电")
-            self.status_bar.showMessage(f"压电传感器已连接: {port}")
+            self.status_bar.showMessage(f"压电传感器已连接: {port} ADC{self.piezo_adc_group + 1}")
         else:
             self.piezo_thread.stop()
             self.piezo_thread = None

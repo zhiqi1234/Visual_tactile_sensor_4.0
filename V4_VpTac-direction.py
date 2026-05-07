@@ -447,7 +447,7 @@ class VideoPointCloudPlayer(QMainWindow):
         self.spin_camera_idx.setPrefix("ID: ")
 
         self.chk_rotate = QCheckBox("旋转180°")
-        self.chk_rotate.setChecked(True)
+        self.chk_rotate.setChecked(False)
 
         control_layout.addWidget(self.btn_select_input)
         control_layout.addWidget(self.btn_play_pause)

@@ -87,7 +87,7 @@ class CameraThread(QThread):
 
     def run(self):
         # 打开默认摄像头 (索引0)
-        self.video_cap = cv2.VideoCapture(1)
+        self.video_cap = cv2.VideoCapture(2)
         
         # 尝试设置硬件参数
         self.video_cap.set(cv2.CAP_PROP_FPS, self.target_fps)
@@ -103,11 +103,10 @@ class CameraThread(QThread):
             ret, frame = self.video_cap.read()
             if ret:
                 # =================================================
-                # 【修改处】在这里进行旋转 180 度
-                # cv2.ROTATE_180 表示顺时针旋转180度
+                # 【修改处】不再旋转 180 度
                 # =================================================
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
-                
+                # frame = cv2.rotate(frame, cv2.ROTATE_180)
+
                 # 发送信号给GUI显示
                 self.change_pixmap_signal.emit(frame)
             
@@ -136,7 +135,7 @@ class CameraThread(QThread):
 class RecorderGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.title = "Vptac 数据采集助手 (已旋转180°)"
+        self.title = "Vptac 数据采集助手"
         self.setWindowTitle(self.title)
         self.setGeometry(100, 100, 1000, 800)
 
