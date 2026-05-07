@@ -74,7 +74,7 @@ class PiezoSerialThread(QThread):
         self.last_clear_time = 0
 
         # 按ADC组(0-4)分组的共享缓冲区，每行 (timestamp, voltage)
-        self._group_bufs = [deque(maxlen=2000) for _ in range(self._N_GROUPS)]
+        self._group_bufs = [deque(maxlen=6000) for _ in range(self._N_GROUPS)]
         self._buf_lock = threading.Lock()
         self._selected_adc_group = 0  # 当前选中ADC组
         self._selected_channel = 0   # 当前选中通道
@@ -455,7 +455,7 @@ class V7MainWindow(QMainWindow):
 
         # 3D 视角
         self.view_elev = 90
-        self.view_azim = 0
+        self.view_azim = 180
         self.view_roll = -90
         self.view_saved = False
         self.is_dragging = False
@@ -1176,14 +1176,17 @@ class V7MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", f"ROI加载失败: {e}")
             return False
 
-        # mirror_axis
+        # mirror_axis & image_shape
         mirror_axis = 640
+        ref_image_shape = None
         history_file = os.path.join(self.data_save_dir, "matched_points.npz")
         if os.path.exists(history_file):
             try:
                 with np.load(history_file) as npz_data:
                     if 'mirror_axis' in npz_data:
                         mirror_axis = int(npz_data['mirror_axis'])
+                    if 'image_shape' in npz_data:
+                        ref_image_shape = tuple(int(v) for v in npz_data['image_shape'])
             except Exception:
                 pass
 
@@ -1210,7 +1213,11 @@ class V7MainWindow(QMainWindow):
 
         K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
         K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-        h, w = 480, 1280
+        # 使用首帧数据生成时的图像尺寸进行立体校正，确保与 frame_000_points.txt 中的 3D 坐标一致
+        if ref_image_shape is not None:
+            h, w = ref_image_shape
+        else:
+            h, w = 480, 1280
         R1, R2, P1, P2 = self._get_stereo_rectify(w, h)
         pts1 = cv2.undistortPoints(pts1_R, K1, D1, R=R1, P=P1).squeeze()
         pts2 = cv2.undistortPoints(pts2_R, K2, D2, R=R2, P=P2).squeeze()
@@ -1224,6 +1231,8 @@ class V7MainWindow(QMainWindow):
             'left_points_0_pre': pts1_R.copy(), 'right_points_0_pre': pts2_R.copy(),
             'base_3d_points': points_3d,
             'mirror_axis': mirror_axis,
+            'ref_image_shape': (h, w),
+            'frame_height': h,
         })
 
         if len(points_3d) >= 3:
@@ -1271,10 +1280,12 @@ class V7MainWindow(QMainWindow):
         self.current_frame_idx += 1
 
         h, w = frame.shape[:2]
-        if self.FRAME_DATA['mirror_axis'] is None or self.FRAME_DATA['mirror_axis'] != w // 2:
-            R1, R2, P1, P2 = self._get_stereo_rectify(w, h)
-            self.FRAME_DATA['P1'] = P1
-            self.FRAME_DATA['P2'] = P2
+        ref_shape = self.FRAME_DATA.get('ref_image_shape')
+        if ref_shape is not None and (h, w) != ref_shape:
+            if self.current_frame_idx == 1:
+                QMessageBox.warning(self, "警告",
+                    f"摄像头分辨率 {w}x{h} 与首帧数据生成时的分辨率 "
+                    f"{ref_shape[1]}x{ref_shape[0]} 不一致，三维重建会出现偏移。")
 
         if self.current_frame_idx % 10 == 0:
             self.lbl_frame_info.setText(f"帧: {self.current_frame_idx}")
@@ -2053,9 +2064,9 @@ class V7MainWindow(QMainWindow):
                 ax.view_init(elev=self.view_elev, azim=self.view_azim)
         else:
             try:
-                ax.view_init(elev=90, azim=0, roll=-90)
+                ax.view_init(elev=90, azim=180, roll=-90)
             except TypeError:
-                ax.view_init(elev=90, azim=0)
+                ax.view_init(elev=90, azim=180)
 
         # 使用blit加速渲染
         self.canvas_3d.draw_idle()

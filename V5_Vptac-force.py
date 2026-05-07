@@ -71,7 +71,7 @@ class PiezoSerialThread(QThread):
         self._last_clear_time = 0
 
         # 按ADC组分组的共享缓冲区：5组，每行 (timestamp, ch0..ch7)
-        self._group_bufs = [deque(maxlen=3000) for _ in range(self._N_GROUPS)]
+        self._group_bufs = [deque(maxlen=6000) for _ in range(self._N_GROUPS)]
         self._buf_lock = threading.Lock()
 
         # 当前选中的ADC组和预览通道（主线程可随时改，int赋值原子安全）
@@ -94,14 +94,14 @@ class PiezoSerialThread(QThread):
 
     def get_plot_data(self):
         """获取当前选中ADC组、预览通道的波形数据（用于 PyQtGraph 刷新）
-        返回 np.ndarray 电压序列，最多2000点
+        返回 np.ndarray 电压序列，最多5000点
         """
         with self._buf_lock:
             buf = list(self._group_bufs[self._selected_adc_group])
         if not buf:
             return np.array([], dtype=np.float32)
         ch = self._preview_ch + 1  # buf 每行: (ts, ch0..ch7)，索引+1
-        return np.array([row[ch] for row in buf[-2000:]], dtype=np.float32)
+        return np.array([row[ch] for row in buf[-5000:]], dtype=np.float32)
 
     def get_recording_snapshot(self):
         """获取当前选中ADC组的完整缓冲区快照用于保存
@@ -471,7 +471,7 @@ class VideoPointCloudPlayer(QMainWindow):
 
         # 3D视角
         self.view_elev = 90
-        self.view_azim = 0
+        self.view_azim = 180
         self.view_roll = -90  # 添加roll参数，初始在XY平面顺时针旋转90°
         self.view_saved = False
         self.is_dragging = False
@@ -1101,14 +1101,17 @@ class VideoPointCloudPlayer(QMainWindow):
             QMessageBox.warning(self, "警告", f"未找到ROI文件: {roi_file}")
             return False
 
-        # 从matched_points.npz加载mirror_axis
-        mirror_axis = 640  # 默认值
+        # 从matched_points.npz加载mirror_axis和image_shape
+        mirror_axis = 640
+        ref_image_shape = None  # 生成首帧数据时的图像尺寸 (h, w)
         history_file = os.path.join(self.data_save_dir, "matched_points.npz")
         if os.path.exists(history_file):
             try:
                 with np.load(history_file) as npz_data:
                     if 'mirror_axis' in npz_data:
                         mirror_axis = int(npz_data['mirror_axis'])
+                    if 'image_shape' in npz_data:
+                        ref_image_shape = tuple(int(v) for v in npz_data['image_shape'])
             except Exception as e:
                 pass
 
@@ -1141,8 +1144,12 @@ class VideoPointCloudPlayer(QMainWindow):
         K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
         R, T = self.stereo_params['R'], self.stereo_params['T']
 
-        # 使用默认图像尺寸进行立体校正
-        h, w = 480, 1280  # 默认尺寸，会在收到第一帧时更新
+        # 使用首帧数据生成时的图像尺寸进行立体校正，确保与 frame_000_points.txt 中的 3D 坐标一致
+        if ref_image_shape is not None:
+            h, w = ref_image_shape
+        else:
+            h, w = 480, 1280
+        self.FRAME_DATA['ref_image_shape'] = (h, w)
         R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
                                                      flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
 
@@ -1153,7 +1160,7 @@ class VideoPointCloudPlayer(QMainWindow):
         self.FRAME_DATA.update({
             'initialized': True,
             'roi_masks': {'left': self.drawing['left']['mask'], 'right': self.drawing['right']['mask']},
-            'P1': P1, 'P2': P2,
+            'P1': P1, 'P2': P2, 'R1': R1, 'R2': R2,
             'left_points_0': pts1, 'right_points_0': pts2,
             'left_points_0_R': pts1_R, 'right_points_0_R': pts2_R,
             'left_points_0_pre': pts1_R.copy(), 'right_points_0_pre': pts2_R.copy(),
@@ -1211,17 +1218,14 @@ class VideoPointCloudPlayer(QMainWindow):
         self.latest_camera_frame = frame
         self.current_frame_idx += 1
 
-        # 更新mirror_axis（如果图像尺寸变化）
+        # 校验：实时帧尺寸必须与首帧数据生成时的尺寸一致，否则 P1/P2 会与 base_3d_points 不匹配
         h, w = frame.shape[:2]
-        if self.FRAME_DATA['mirror_axis'] is None or self.FRAME_DATA['mirror_axis'] != w // 2:
-            # 重新计算投影矩阵
-            K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
-            K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-            R, T = self.stereo_params['R'], self.stereo_params['T']
-            R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                         flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
-            self.FRAME_DATA['P1'] = P1
-            self.FRAME_DATA['P2'] = P2
+        ref_shape = self.FRAME_DATA.get('ref_image_shape')
+        if ref_shape is not None and (h, w) != ref_shape:
+            if self.current_frame_idx == 1:
+                QMessageBox.warning(self, "警告",
+                    f"摄像头分辨率 {w}x{h} 与首帧数据生成时的分辨率 "
+                    f"{ref_shape[1]}x{ref_shape[0]} 不一致，三维重建会出现偏移。")
 
         # 每10帧更新一次帧计数显示，减少GUI更新频率
         if self.current_frame_idx % 10 == 0:
@@ -1465,12 +1469,13 @@ class VideoPointCloudPlayer(QMainWindow):
         self.FRAME_DATA.update({
             'initialized': True,
             'roi_masks': {'left': self.drawing['left']['mask'], 'right': self.drawing['right']['mask']},
-            'P1': P1, 'P2': P2,
+            'P1': P1, 'P2': P2, 'R1': R1, 'R2': R2,
             'left_points_0': pts1, 'right_points_0': pts2,
             'left_points_0_R': pts1_R, 'right_points_0_R': pts2_R,
             'left_points_0_pre': pts1_R.copy(), 'right_points_0_pre': pts2_R.copy(),
             'base_3d_points': points_3d,
             'mirror_axis': mirror_axis,
+            'ref_image_shape': (h, w),
         })
 
         # 构建坐标系
@@ -1538,19 +1543,29 @@ class VideoPointCloudPlayer(QMainWindow):
         self.FRAME_DATA['left_points_0_R'] = left_pts.copy()
         self.FRAME_DATA['right_points_0_R'] = right_pts.copy()
 
-        # 重新计算基准3D点
+        # 重新计算基准3D点 — 复用 load 时缓存的 R1/R2/P1/P2
         K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
         K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-        R, T = self.stereo_params['R'], self.stereo_params['T']
-        w, h = self.FRAME_DATA['mirror_axis'] * 2, self.FRAME_DATA.get('frame_height', 480)
+        R1 = self.FRAME_DATA['R1']
+        R2 = self.FRAME_DATA['R2']
+        P1 = self.FRAME_DATA['P1']
+        P2 = self.FRAME_DATA['P2']
 
-        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                     flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
         l_pts_ud = cv2.undistortPoints(left_pts, K1, D1, R=R1, P=P1).squeeze()
         r_pts_ud = cv2.undistortPoints(right_pts, K2, D2, R=R2, P=P2).squeeze()
         points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
 
         self.FRAME_DATA['base_3d_points'] = points_3d
+
+        # 基准帧变化后，必须重新计算 PCA 局部坐标系（否则面会偏移/倾斜）
+        if len(points_3d) >= 3:
+            origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
+            self.FRAME_DATA['transform_origin'] = origin
+            self.FRAME_DATA['transform_rotation'] = rotation_matrix
+
+        # 基准帧拓扑边也要重建
+        self.FRAME_DATA['left_edges'] = self.extract_edges(left_pts.astype(np.float64))
+        self.FRAME_DATA['right_edges'] = self.extract_edges(right_pts.astype(np.float64))
 
         # 重置 scatter 对象，基准帧变化后需要重建
         self._scatter_plot = None
@@ -1933,16 +1948,17 @@ class VideoPointCloudPlayer(QMainWindow):
                     np.zeros(n_total, dtype=bool),
                     True)
 
-        # 三维重建
+        # 三维重建 — 复用首帧 load 时算好的 R1/R2/P1/P2，确保和 base_3d_points 同一坐标系
         left_points_R = left_points_R.astype(np.float32)
         right_points_R = right_points_R.astype(np.float32)
 
         K1, D1 = self.stereo_params['K1'], self.stereo_params['D1']
         K2, D2 = self.stereo_params['K2'], self.stereo_params['D2']
-        R, T = self.stereo_params['R'], self.stereo_params['T']
+        R1 = self.FRAME_DATA['R1']
+        R2 = self.FRAME_DATA['R2']
+        P1 = self.FRAME_DATA['P1']
+        P2 = self.FRAME_DATA['P2']
 
-        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(K1, D1, K2, D2, (w, h), R, T,
-                                                     flags=cv2.CALIB_ZERO_DISPARITY, alpha=0.9)
         l_pts_ud = cv2.undistortPoints(left_points_R, K1, D1, R=R1, P=P1).squeeze()
         r_pts_ud = cv2.undistortPoints(right_points_R, K2, D2, R=R2, P=P2).squeeze()
         points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
@@ -2301,9 +2317,9 @@ class VideoPointCloudPlayer(QMainWindow):
                 ax.view_init(elev=self.view_elev, azim=self.view_azim)
         else:
             try:
-                ax.view_init(elev=90, azim=0, roll=-90)
+                ax.view_init(elev=90, azim=180, roll=-90)
             except TypeError:
-                ax.view_init(elev=90, azim=0)
+                ax.view_init(elev=90, azim=180)
 
         self.canvas_3d.draw_idle()
 
