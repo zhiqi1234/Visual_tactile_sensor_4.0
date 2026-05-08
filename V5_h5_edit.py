@@ -15,7 +15,6 @@ from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
-import pyqtgraph as pg
 
 
 class HDF5Viewer(QMainWindow):
@@ -40,6 +39,7 @@ class HDF5Viewer(QMainWindow):
         self._seg_artists = []  # [(span_f, span_m, vline_s_f, vline_s_m, vline_e_f, vline_e_m), ...]
         self._force_axes = None  # (ax_f, ax_m) 缓存
         self._force_plot_cached = False  # 力觉图表是否已缓存
+        self._force_frame_markers = []  # 当前帧标记线引用，用于清理
 
         # 源文件路径
         self._source_pc_path = ""
@@ -53,6 +53,7 @@ class HDF5Viewer(QMainWindow):
 
         # 压电传感器相关
         self.piezo_channel = 0  # 当前选择的通道（0-7）
+        self.piezo_adc_group = 1  # 当前选择的ADC组（0-4，默认ADC2）
         self.piezo_window_ms = 33  # 时间窗口（毫秒）
 
         # 文件导航
@@ -306,6 +307,12 @@ class HDF5Viewer(QMainWindow):
         piezo_control_layout = QHBoxLayout(piezo_control_group)
         piezo_control_layout.setContentsMargins(8, 20, 8, 8)
 
+        lbl_piezo_adc = QLabel("ADC组:")
+        self.cbb_piezo_adc_group = QComboBox()
+        self.cbb_piezo_adc_group.addItems([f"ADC{i+1}" for i in range(5)])
+        self.cbb_piezo_adc_group.setCurrentIndex(1)  # 默认 ADC2
+        self.cbb_piezo_adc_group.currentIndexChanged.connect(self._on_piezo_adc_group_changed)
+
         lbl_piezo_ch = QLabel("通道:")
         self.cbb_piezo_channel = QComboBox()
         self.cbb_piezo_channel.addItems([f"CH{i+1}" for i in range(8)])
@@ -319,6 +326,8 @@ class HDF5Viewer(QMainWindow):
         self.spin_piezo_window.setSuffix(" ms")
         self.spin_piezo_window.valueChanged.connect(self._on_piezo_window_changed)
 
+        piezo_control_layout.addWidget(lbl_piezo_adc)
+        piezo_control_layout.addWidget(self.cbb_piezo_adc_group)
         piezo_control_layout.addWidget(lbl_piezo_ch)
         piezo_control_layout.addWidget(self.cbb_piezo_channel)
         piezo_control_layout.addWidget(lbl_piezo_window)
@@ -326,22 +335,27 @@ class HDF5Viewer(QMainWindow):
         piezo_control_layout.addStretch()
         main_layout.addWidget(piezo_control_group)
 
-        # 压电波形图（PyQtGraph）
+        # 压电波形图（Matplotlib）
         piezo_plot_group = QGroupBox("压电信号波形")
         piezo_plot_layout = QVBoxLayout(piezo_plot_group)
         piezo_plot_layout.setContentsMargins(8, 20, 8, 8)
 
-        self.piezo_plot_widget = pg.GraphicsLayoutWidget()
-        self.piezo_plot_widget.setBackground('w')
-        self.piezo_plot = self.piezo_plot_widget.addPlot(title="压电信号 (选中通道)")
-        self.piezo_plot.setLabel('left', '电压 (V)')
-        self.piezo_plot.setLabel('bottom', '时间 (s)')
-        self.piezo_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.piezo_curve = self.piezo_plot.plot(pen=pg.mkPen('b', width=1))
-        self.piezo_vline = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('r', width=2, style=pg.QtCore.Qt.DashLine))
-        self.piezo_plot.addItem(self.piezo_vline)
+        self.fig_piezo = plt.figure(figsize=(8, 2))
+        self.canvas_piezo = FigureCanvas(self.fig_piezo)
+        self.canvas_piezo.setMinimumHeight(150)
+        self.toolbar_piezo = NavigationToolbar(self.canvas_piezo, self)
+        self.piezo_ax = self.fig_piezo.add_subplot(111)
+        self.piezo_ax.set_ylabel('电压 (V)')
+        self.piezo_ax.set_xlabel('时间 (s)')
+        self.piezo_ax.grid(True, alpha=0.3)
+        (self.piezo_line,) = self.piezo_ax.plot([], [], 'b-', linewidth=0.8)
+        self.piezo_marker = self.piezo_ax.axvline(0, color='r', linewidth=1.5,
+                                                    linestyle='--', alpha=0.8)
+        self.piezo_ax.set_title("压电信号 (无数据)", fontsize=10)
+        self.fig_piezo.tight_layout()
 
-        piezo_plot_layout.addWidget(self.piezo_plot_widget)
+        piezo_plot_layout.addWidget(self.toolbar_piezo)
+        piezo_plot_layout.addWidget(self.canvas_piezo)
         main_layout.addWidget(piezo_plot_group, 1)
 
         # ── 力觉数据 + 有效段控件 ──
@@ -519,16 +533,42 @@ class HDF5Viewer(QMainWindow):
             self._update_nav_buttons()
 
     def _auto_load_force_file(self, filepath):
-        """自动加载对应的力觉文件"""
+        """自动加载对应的力觉文件（根据时间戳就近匹配）"""
         basename = os.path.basename(filepath)
         dirpath = os.path.dirname(filepath)
-        if basename.startswith("calibration_") and not basename.startswith("ft_"):
-            ft_path = os.path.join(dirpath, "ft_" + basename)
-            if os.path.isfile(ft_path):
-                self.load_force_file(ft_path)
+        if not basename.startswith("calibration_") or basename.startswith("ft_"):
+            return
+        # 1) 尝试精确匹配: ft_ + 点云文件名
+        ft_path = os.path.join(dirpath, "ft_" + basename)
+        if os.path.isfile(ft_path):
+            self.load_force_file(ft_path)
+            self.statusBar().showMessage(
+                self.statusBar().currentMessage() +
+                f"  |  自动加载力觉文件: {os.path.basename(ft_path)}")
+            return
+        # 2) 扫描目录，按文件名中的时间戳就近匹配
+        import glob
+        import re
+        ft_candidates = sorted(glob.glob(os.path.join(dirpath, "ft_calibration_*.h5")))
+        if not ft_candidates:
+            return
+        # 从点云文件名提取时间戳
+        m = re.search(r'(\d{8}_\d{6})', basename)
+        if m:
+            pc_ts = m.group(1)
+            best, best_dist = None, float('inf')
+            for cand in ft_candidates:
+                cm = re.search(r'(\d{8}_\d{6})', os.path.basename(cand))
+                if cm:
+                    dist = abs(int(cm.group(1).replace('_', '')) - int(pc_ts.replace('_', '')))
+                    if dist < best_dist:
+                        best_dist = dist
+                        best = cand
+            if best is not None:
+                self.load_force_file(best)
                 self.statusBar().showMessage(
                     self.statusBar().currentMessage() +
-                    f"  |  自动加载力觉文件: {os.path.basename(ft_path)}")
+                    f"  |  自动加载力觉文件: {os.path.basename(best)}")
 
     def open_file(self):
         filepath, _ = QFileDialog.getOpenFileName(
@@ -551,7 +591,6 @@ class HDF5Viewer(QMainWindow):
     def load_force_file(self, filepath):
         """加载力觉数据文件"""
         self.ft_data = {}
-        self.piezo_data = {}
         self._is_from_processed = False
         # 重置力偏差，避免旧偏差应用到新文件
         self.force_bias[:] = 0.0
@@ -576,23 +615,6 @@ class HDF5Viewer(QMainWindow):
                     cols = cols.decode('utf-8')
                 self.ft_data['columns'] = cols.split(',')
 
-                # 加载压电数据（如果存在）
-                if 'piezo' in f:
-                    piezo_grp = f['piezo']
-                    if 'timestamp' in piezo_grp and 'values' in piezo_grp:
-                        self.piezo_data['timestamp'] = piezo_grp['timestamp'][:]
-                        raw_vals = piezo_grp['values'][:]  # (M,) 或 (M, 8)
-                        self.piezo_data['raw_values'] = raw_vals  # 保留全部通道
-                        # 默认取第0通道（CH1）用于显示
-                        if raw_vals.ndim == 2:
-                            self.piezo_data['values'] = raw_vals[:, self.piezo_channel]
-                            self.piezo_data['n_channels'] = raw_vals.shape[1]
-                        else:
-                            self.piezo_data['values'] = raw_vals
-                            self.piezo_data['n_channels'] = 1
-                        self.piezo_data['channel'] = int(piezo_grp.attrs.get('channel', 1))
-                        print(f"已加载压电数据: {len(self.piezo_data['timestamp'])} 采样, "
-                              f"{self.piezo_data['n_channels']} 通道")
         except Exception as e:
             self.statusBar().showMessage(f"读取力觉文件失败: {e}")
             return
@@ -613,18 +635,6 @@ class HDF5Viewer(QMainWindow):
         for i, col in enumerate(self.ft_data['columns']):
             v = ft_vals[:, i]
             lines.append(f"  {col}: min={v.min():.4f}  max={v.max():.4f}  mean={v.mean():.4f}")
-
-        # 压电数据摘要
-        if self.piezo_data:
-            piezo_ts = self.piezo_data['timestamp']
-            piezo_vals = self.piezo_data['values']
-            lines += ["", "=" * 50, "  压电数据信息", "=" * 50,
-                     f"采样数: {len(piezo_ts)}", f"通道: CH{self.piezo_data['channel']}"]
-            if len(piezo_ts) > 1:
-                dur = piezo_ts[-1] - piezo_ts[0]
-                rate = (len(piezo_ts) - 1) / dur if dur > 0 else 0
-                lines += [f"总时长: {dur:.2f} s", f"采样率: {rate:.1f} Hz"]
-            lines.append(f"  电压范围: {piezo_vals.min():.4f} ~ {piezo_vals.max():.4f} V")
 
         self.txt_info.append("\n".join(lines))
         self.statusBar().showMessage(f"已加载力觉文件: {os.path.basename(filepath)} | 采样数: {len(ft_ts)}")
@@ -757,6 +767,24 @@ class HDF5Viewer(QMainWindow):
             return
 
         self.txt_info.setPlainText("\n".join(lines))
+
+        # 加载压电数据（从点云文件自身）
+        self._load_piezo_from_pc_file(filepath)
+
+        # 压电数据信息追加到信息面板
+        if self.piezo_data:
+            piezo_lines = ["", "=" * 50, "  压电数据信息（来自点云文件）", "=" * 50,
+                           f"ADC组: {self.piezo_data.get('adc_group', 'N/A')}",
+                           f"采样数: {len(self.piezo_data['timestamp'])}",
+                           f"通道数: {self.piezo_data.get('n_channels', 'N/A')}"]
+            piezo_ts = self.piezo_data['timestamp']
+            if len(piezo_ts) > 1:
+                dur = piezo_ts[-1] - piezo_ts[0]
+                rate = (len(piezo_ts) - 1) / dur if dur > 0 else 0
+                piezo_lines += [f"时长: {dur:.2f} s", f"采样率: {rate:.1f} Hz"]
+            piezo_vals = self.piezo_data['values']
+            piezo_lines.append(f"电压范围 (CH{self.piezo_channel + 1}): {piezo_vals.min():.4f} ~ {piezo_vals.max():.4f} V")
+            self.txt_info.append("\n".join(piezo_lines))
 
         if 'xyz' in self.h5_data:
             self.total_frames = self.h5_data['xyz'].shape[0]
@@ -921,6 +949,7 @@ class HDF5Viewer(QMainWindow):
 
         self._update_scroll_range()
         self.fig_force.clear()
+        self._force_frame_markers.clear()
         ax_f = self.fig_force.add_subplot(211)
         ax_m = self.fig_force.add_subplot(212, sharex=ax_f)
 
@@ -1017,25 +1046,21 @@ class HDF5Viewer(QMainWindow):
         ax_f, ax_m = self._force_axes
         cur_force_vals = None
 
-        # 清除旧的帧标记线（只清除当前帧线，不清除整个图表）
-        for line in ax_f.get_lines()[-10:]:  # 只检查最后几条线
-            if hasattr(line, '_label') and line._label is None:
-                if line.get_linestyle() == '--':
-                    line.remove()
-        for line in ax_m.get_lines()[-10:]:
-            if hasattr(line, '_label') and line._label is None:
-                if line.get_linestyle() == '--':
-                    line.remove()
+        # 清除旧的帧标记线（直接移除已追踪的标记线）
+        for marker in self._force_frame_markers:
+            marker.remove()
+        self._force_frame_markers.clear()
 
         # 绘制当前帧竖线
         if frame_idx is not None and 'timestamp' in self.h5_data:
             vision_ts = self.h5_data['timestamp']
             cur_abs = vision_ts[frame_idx] + self.time_offset
             cur_ft_rel = cur_abs - ft_ts[0]
-            ax_f.axvline(cur_ft_rel, color='#333333', linewidth=1.2,
+            m1 = ax_f.axvline(cur_ft_rel, color='#333333', linewidth=1.2,
                         linestyle='--', alpha=0.8)
-            ax_m.axvline(cur_ft_rel, color='#333333', linewidth=1.2,
+            m2 = ax_m.axvline(cur_ft_rel, color='#333333', linewidth=1.2,
                         linestyle='--', alpha=0.8)
+            self._force_frame_markers.extend([m1, m2])
             if ft_ts[0] <= cur_abs <= ft_ts[-1]:
                 idx = min(np.searchsorted(ft_ts, cur_abs), len(ft_ts) - 1)
                 cur_force_vals = ft_vals[idx]
@@ -1559,10 +1584,47 @@ class HDF5Viewer(QMainWindow):
     # ──────────────────────────────────────────────
     #  压电信号相关方法
     # ──────────────────────────────────────────────
+    def _load_piezo_from_pc_file(self, filepath):
+        """从点云文件中加载压电数据（/piezo_stream/adc{group}/）"""
+        self.piezo_data = {}
+        try:
+            with h5py.File(filepath, 'r') as f:
+                if 'piezo_stream' not in f:
+                    return
+                ps = f['piezo_stream']
+                grp_name = f'adc{self.piezo_adc_group + 1}'
+                if grp_name not in ps:
+                    return
+                grp = ps[grp_name]
+                if 'timestamp' not in grp or 'values' not in grp:
+                    return
+                ts = grp['timestamp'][:]
+                raw_vals = grp['values'][:]  # (N, 8)
+                self.piezo_data['timestamp'] = ts
+                self.piezo_data['raw_values'] = raw_vals
+                if raw_vals.ndim == 2 and raw_vals.shape[1] == 8:
+                    self.piezo_data['values'] = raw_vals[:, self.piezo_channel]
+                    self.piezo_data['n_channels'] = 8
+                else:
+                    self.piezo_data['values'] = raw_vals
+                    self.piezo_data['n_channels'] = 1
+                self.piezo_data['channel'] = self.piezo_channel + 1
+                self.piezo_data['adc_group'] = self.piezo_adc_group + 1
+                print(f"已从点云文件加载压电数据 (ADC{self.piezo_adc_group + 1}): "
+                      f"{len(ts)} 采样, CH{self.piezo_channel + 1}")
+        except Exception as e:
+            print(f"加载压电数据失败: {e}")
+
+    def _on_piezo_adc_group_changed(self, index):
+        """ADC组切换：重新从点云文件加载对应ADC组的压电数据"""
+        self.piezo_adc_group = index
+        if self._source_pc_path:
+            self._load_piezo_from_pc_file(self._source_pc_path)
+        self.update_piezo_plot()
+
     def _on_piezo_channel_changed(self, index):
         """压电通道切换：从已加载的8通道原始数据中取对应列"""
         self.piezo_channel = index
-        # 如果已加载多通道原始数据，切换显示列
         if self.piezo_data and 'raw_values' in self.piezo_data:
             raw = self.piezo_data['raw_values']
             if raw.ndim == 2 and index < raw.shape[1]:
@@ -1576,26 +1638,68 @@ class HDF5Viewer(QMainWindow):
         self.piezo_window_ms = value
 
     def update_piezo_plot(self, frame_idx=None):
-        """更新压电波形显示"""
+        """更新压电波形显示 (matplotlib)"""
         if not self.piezo_data:
-            self.piezo_curve.setData([], [])
+            self.piezo_line.set_data([], [])
+            self.piezo_marker.set_xdata([0, 0])
+            self.piezo_ax.set_title("压电信号 (无数据)", fontsize=10)
+            self.piezo_ax.relim()
+            self.piezo_ax.autoscale_view()
+            self.canvas_piezo.draw_idle()
             return
 
         piezo_ts = self.piezo_data['timestamp']
-        piezo_vals = self.piezo_data['values']
+        piezo_vals_all = np.asarray(self.piezo_data['values'], dtype=np.float64).ravel()
+        adc_group = self.piezo_data.get('adc_group', self.piezo_adc_group + 1)
+        ch = self.piezo_channel + 1
 
-        # 转换为相对时间（相对于压电数据起点）
-        t_rel = piezo_ts - piezo_ts[0]
-        self.piezo_curve.setData(t_rel, piezo_vals)
+        # 过滤 NaN/Inf，计算全量数据的Y范围
+        finite_mask = np.isfinite(piezo_vals_all)
+        if not np.any(finite_mask):
+            self.piezo_line.set_data([], [])
+            self.piezo_marker.set_xdata([0, 0])
+            self.piezo_ax.set_title(f"压电信号 — ADC{adc_group} CH{ch} (无效数据)", fontsize=10)
+            self.canvas_piezo.draw_idle()
+            return
 
-        # 更新当前帧标记线
-        if frame_idx is not None and 'timestamp' in self.h5_data and self.ft_data:
+        y_min = float(piezo_vals_all[finite_mask].min())
+        y_max = float(piezo_vals_all[finite_mask].max())
+        y_span = y_max - y_min
+        if y_span < 1e-6:
+            self.piezo_ax.set_ylim(y_min - 0.5, y_max + 0.5)
+        else:
+            margin = max(y_span * 0.1, 0.05)
+            self.piezo_ax.set_ylim(y_min - margin, y_max + margin)
+
+        # 计算相对时间
+        t0 = piezo_ts[0]
+        t_rel_all = (piezo_ts - t0).astype(np.float64)
+
+        # 大数据降采样显示（保留波形形状）
+        n = len(t_rel_all)
+        MAX_DISPLAY = 50000
+        if n > MAX_DISPLAY:
+            stride = max(1, n // MAX_DISPLAY)
+            t_plot = t_rel_all[::stride]
+            v_plot = piezo_vals_all[::stride]
+        else:
+            t_plot = t_rel_all
+            v_plot = piezo_vals_all
+
+        self.piezo_line.set_data(t_plot, v_plot)
+        self.piezo_ax.set_xlim(t_rel_all[0], t_rel_all[-1])
+        self.piezo_ax.set_title(f"压电信号 — ADC{adc_group} CH{ch}", fontsize=10)
+
+        # 更新帧标记线
+        if frame_idx is not None and 'timestamp' in self.h5_data:
             vision_ts = self.h5_data['timestamp']
-            ft_ts = self.ft_data['timestamp']
             cur_abs = vision_ts[frame_idx] + self.time_offset
-            # 压电时间相对于压电数据起点
-            cur_piezo_rel = cur_abs - piezo_ts[0]
-            self.piezo_vline.setPos(cur_piezo_rel)
+            cur_piezo_rel = cur_abs - t0
+        else:
+            cur_piezo_rel = t_rel_all[0]
+        self.piezo_marker.set_xdata([cur_piezo_rel, cur_piezo_rel])
+
+        self.canvas_piezo.draw_idle()
 
     def extract_piezo_window_features(self, vision_timestamp, piezo_ts, piezo_vals, window_ms=33):
         """提取时间窗口 [T-window_ms, T] 内的压电统计特征
@@ -1757,7 +1861,8 @@ class HDF5Viewer(QMainWindow):
                     pg_grp.create_dataset('features', data=piezo_features)
                     pg_grp.attrs['feature_names'] = 'mean,std,rms,max,energy'
                     pg_grp.attrs['window_ms'] = self.piezo_window_ms
-                    pg_grp.attrs['source_channel'] = self.piezo_data.get('channel', 1)
+                    pg_grp.attrs['source_channel'] = self.piezo_channel + 1
+                    pg_grp.attrs['source_adc_group'] = self.piezo_adc_group + 1
                     print(f"已保存压电特征: {piezo_features.shape}")
 
                 mg = f.create_group('meta')
@@ -1891,6 +1996,10 @@ class HDF5Viewer(QMainWindow):
         self._source_pc_path = self._source_pc_path or filepath
         self.lbl_file.setText(filepath)
         self.lbl_force_file.setText("(处理后文件，力觉数据已内嵌)")
+
+        # 尝试从源点云文件重新加载压电原始数据
+        if self._source_pc_path and os.path.isfile(self._source_pc_path):
+            self._load_piezo_from_pc_file(self._source_pc_path)
 
         # 更新帧控件
         if 'xyz' in self.h5_data:

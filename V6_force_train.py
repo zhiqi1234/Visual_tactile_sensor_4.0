@@ -484,7 +484,7 @@ def split_by_contiguous(dataset, train_val_fnames, test_fnames, val_ratio=0.15):
 
 
 def train(args):
-    # ── 选择文件 ──
+    # ── 选择文件（只选一次，两个模型共用）──
     if args.no_interact:
         data_dir = args.data_dir
         h5_files = sorted(glob.glob(os.path.join(data_dir, "processed_*.h5")))
@@ -493,212 +493,174 @@ def train(args):
             sys.exit(1)
         train_val_files = h5_files
         test_files = []
+        piezo_modes = [args.use_piezo]  # 非交互模式用命令行参数
         print(f"[非交互模式] 所有 {len(h5_files)} 个文件用于训练+验证")
     else:
-        # 使用编号选择方式
         data_dir = args.data_dir
         train_val_files, test_files, data_dir = select_files_by_number(data_dir)
-
-    if not train_val_files:
-        print("未选择任何训练文件，退出")
-        sys.exit(1)
+        if not train_val_files:
+            print("未选择任何训练文件，退出")
+            sys.exit(1)
+        piezo_modes = [False, True]  # 交互模式自动训练两个
 
     if data_dir is None:
         data_dir = os.path.dirname(train_val_files[0])
 
-    # ── 加载数据（加载所有选中的文件） ──
     all_files = train_val_files + [f for f in test_files if f not in train_val_files]
-    dataset = ForceDataset(all_files, force_dims=args.force_dims, use_piezo=args.use_piezo)
 
-    # ── 划分数据（先划分，再算 scaler，杜绝泄漏） ──
-    # 使用基于segment的划分方式
-    train_idx, val_idx = dataset.get_segment_based_split(train_ratio=0.8, group_size=10)
+    for use_piezo in piezo_modes:
+        label = "Vision+Piezo" if use_piezo else "Vision-only"
+        subdir = "model_output_vision_piezo" if use_piezo else "model_output_vision_only"
+        save_dir = os.path.join(data_dir, subdir)
 
-    # 处理测试集
-    test_idx = []
-    if test_files:
-        test_fnames = set(os.path.basename(f) for f in test_files)
-        for fname, n_frames, offset in dataset.file_info:
-            if fname in test_fnames:
-                test_idx.extend(range(offset, offset + n_frames))
-                print(f"  {fname}: test={n_frames} (整段)")
+        print(f"\n{'='*60}")
+        print(f"  训练 {label} 模型 → {subdir}/")
+        print(f"{'='*60}")
 
-    # ── 只在训练集上计算标准化参数 ──
-    dataset.compute_scaler(train_idx)
-    scaler = dataset.get_scaler()
-    train_set = Subset(dataset, train_idx)
-    val_set = Subset(dataset, val_idx)
-    test_set = Subset(dataset, test_idx)
+        # ── 加载数据 ──
+        dataset = ForceDataset(all_files, force_dims=args.force_dims, use_piezo=use_piezo)
 
-    # 训练集加噪声增强
-    if args.noise_std > 0:
-        print(f"训练噪声增强: std={args.noise_std}")
-        train_set = NoisySubset(train_set, noise_std=args.noise_std)
+        # ── 划分数据 ──
+        train_idx, val_idx = dataset.get_segment_based_split(train_ratio=0.8, group_size=10)
+        test_idx = []
+        if test_files:
+            test_fnames = set(os.path.basename(f) for f in test_files)
+            for fname, n_frames, offset in dataset.file_info:
+                if fname in test_fnames:
+                    test_idx.extend(range(offset, offset + n_frames))
+                    print(f"  {fname}: test={n_frames} (整段)")
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
-                              num_workers=0, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
-                            num_workers=0, pin_memory=True)
+        # ── Scaler 只在训练集上计算 ──
+        dataset.compute_scaler(train_idx)
+        scaler = dataset.get_scaler()
+        train_set = Subset(dataset, train_idx)
+        val_set = Subset(dataset, val_idx)
 
-    # ── 模型 ──
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n使用设备: {device}")
+        if args.noise_std > 0:
+            print(f"训练噪声增强: std={args.noise_std}")
+            train_set = NoisySubset(train_set, noise_std=args.noise_std)
 
-    input_dim = dataset.X.shape[1]
-    output_dim = dataset.y.shape[1]
-    model = ForceMLP(input_dim=input_dim, output_dim=output_dim,
-                     hidden_dims=args.hidden_dims, dropout=args.dropout).to(device)
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=0, pin_memory=True)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                                num_workers=0, pin_memory=True)
 
-    # ── 训练配置 ──
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    if args.scheduler == 'cosine':
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-    else:
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-    criterion = nn.MSELoss(reduction='none')  # 改为不自动求均值
+        # ── 模型 ──
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"使用设备: {device}")
 
-    # ── 训练循环 ──
-    best_val_loss = float('inf')
-    patience_counter = 0
-    history = {'train_loss': [], 'val_loss': [], 'lr': []}
+        input_dim = dataset.X.shape[1]
+        output_dim = dataset.y.shape[1]
+        model = ForceMLP(input_dim=input_dim, output_dim=output_dim,
+                         hidden_dims=args.hidden_dims, dropout=args.dropout).to(device)
+        print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-    save_dir = os.path.join(data_dir, "model_output")
-    os.makedirs(save_dir, exist_ok=True)
+        # ── 训练配置 ──
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        if args.scheduler == 'cosine':
+            scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+        else:
+            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        criterion = nn.MSELoss(reduction='none')
 
-    # 预计算scaler的tensor版本（用于加权）
-    y_mean_t = torch.tensor(scaler['y_mean'], device=device)
-    y_std_t = torch.tensor(scaler['y_std'], device=device)
+        # ── 训练循环 ──
+        best_val_loss = float('inf')
+        patience_counter = 0
+        history = {'train_loss': [], 'val_loss': [], 'lr': []}
 
-    for epoch in range(1, args.epochs + 1):
-        # Train
-        model.train()
-        train_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            pred = model(xb)
-            loss = criterion(pred, yb).mean()
+        os.makedirs(save_dir, exist_ok=True)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * xb.size(0)
-        train_loss /= len(train_set)
-
-        # Validate
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for xb, yb in val_loader:
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            train_loss = 0.0
+            for xb, yb in train_loader:
                 xb, yb = xb.to(device), yb.to(device)
                 pred = model(xb)
                 loss = criterion(pred, yb).mean()
-                val_loss += loss.item() * xb.size(0)
-        val_loss /= len(val_set)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * xb.size(0)
+            train_loss /= len(train_set)
 
-        current_lr = optimizer.param_groups[0]['lr']
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['lr'].append(current_lr)
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for xb, yb in val_loader:
+                    xb, yb = xb.to(device), yb.to(device)
+                    pred = model(xb)
+                    loss = criterion(pred, yb).mean()
+                    val_loss += loss.item() * xb.size(0)
+            val_loss /= len(val_set)
 
-        if args.scheduler == 'cosine':
-            scheduler.step()
-        else:
-            scheduler.step(val_loss)
+            current_lr = optimizer.param_groups[0]['lr']
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['lr'].append(current_lr)
 
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  "
-                  f"lr={current_lr:.2e}")
+            if args.scheduler == 'cosine':
+                scheduler.step()
+            else:
+                scheduler.step(val_loss)
 
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), os.path.join(save_dir, "model.pth"))
-        else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"\nEarly stopping at epoch {epoch}, best val_loss={best_val_loss:.6f}")
-                break
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"Epoch {epoch:4d}/{args.epochs}  "
+                      f"train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  "
+                      f"lr={current_lr:.2e}")
 
-    # ── 计算零点偏置校正 ──
-    model.load_state_dict(torch.load(os.path.join(save_dir, "model.pth")))
-    model.eval()
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), os.path.join(save_dir, "model.pth"))
+            else:
+                patience_counter += 1
+                if patience_counter >= args.patience:
+                    print(f"\nEarly stopping at epoch {epoch}, best val_loss={best_val_loss:.6f}")
+                    break
 
-    # 在验证集上找零点样本（真实力接近0）
-    zero_threshold = {'fx': 0.3, 'fy': 0.3, 'fz': 0.5, 'mx': 0.01, 'my': 0.01, 'mz': 0.005}
-    zero_mask = np.ones(len(val_idx), dtype=bool)
-    for i, dim_name in enumerate(['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:output_dim]):
-        zero_mask &= (np.abs(dataset.y[val_idx, i]) < zero_threshold[dim_name])
+        # ── 保存 ──
+        np.savez(os.path.join(save_dir, "scaler.npz"), **scaler)
 
-    if zero_mask.sum() > 10:
-        zero_indices = np.array(val_idx)[zero_mask]
-        zero_loader = DataLoader(Subset(dataset, zero_indices.tolist()),
-                                batch_size=args.batch_size, shuffle=False)
+        config = {
+            'input_dim': input_dim,
+            'output_dim': output_dim,
+            'hidden_dims': list(args.hidden_dims),
+            'dropout': list(args.dropout),
+            'lr': args.lr,
+            'batch_size': args.batch_size,
+            'epochs_trained': epoch,
+            'best_val_loss': float(best_val_loss),
+            'device': str(device),
+            'noise_std': args.noise_std,
+            'scheduler': args.scheduler,
+            'train_val_files': [os.path.basename(f) for f in train_val_files],
+            'test_files': [os.path.basename(f) for f in test_files],
+            'total_samples': len(dataset),
+            'train_samples': len(train_idx),
+            'val_samples': len(val_idx),
+            'test_samples': len(test_idx),
+            'use_piezo': use_piezo,
+            'timestamp': datetime.now().strftime('%Y%m%d_%H%M%S'),
+        }
+        with open(os.path.join(save_dir, "train_config.json"), 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
 
-        preds = []
-        with torch.no_grad():
-            for xb, _ in zero_loader:
-                pred = model(xb.to(device))
-                pred = pred.cpu().numpy() * scaler['y_std'] + scaler['y_mean']
-                preds.append(pred)
+        np.savez(os.path.join(save_dir, "train_history.npz"),
+                 train_loss=history['train_loss'],
+                 val_loss=history['val_loss'],
+                 lr=history['lr'])
 
-        bias = np.concatenate(preds, axis=0).mean(axis=0)
-        print(f"\n零点偏置校正 (基于{zero_mask.sum()}个零点样本):")
-        for i, name in enumerate(['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:output_dim]):
-            print(f"  {name}: {bias[i]:.4f}")
-    else:
-        bias = np.zeros(output_dim)
-        print(f"\n零点样本不足({zero_mask.sum()}个)，跳过偏置校正")
+        np.savez(os.path.join(save_dir, "split_indices.npz"),
+                 train=train_idx, val=val_idx, test=test_idx)
 
-    # ── 保存 ──
-    # scaler + bias
-    np.savez(os.path.join(save_dir, "scaler.npz"), **scaler, bias=bias)
+        print(f"\n{label} 训练完成 → {save_dir}")
+        print(f"  model.pth / scaler.npz / train_config.json / train_history.npz / split_indices.npz")
 
-    # 训练配置
-    config = {
-        'input_dim': input_dim,
-        'output_dim': output_dim,
-        'hidden_dims': list(args.hidden_dims),
-        'dropout': list(args.dropout),
-        'lr': args.lr,
-        'batch_size': args.batch_size,
-        'epochs_trained': epoch,
-        'best_val_loss': float(best_val_loss),
-        'device': str(device),
-        'noise_std': args.noise_std,
-        'scheduler': args.scheduler,
-        'train_val_files': [os.path.basename(f) for f in train_val_files],
-        'test_files': [os.path.basename(f) for f in test_files],
-        'total_samples': len(dataset),
-        'train_samples': len(train_idx),
-        'val_samples': len(val_idx),
-        'test_samples': len(test_idx),
-        'use_piezo': args.use_piezo,
-        'timestamp': datetime.now().strftime('%Y%m%d_%H%M%S'),
-    }
-    with open(os.path.join(save_dir, "train_config.json"), 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-
-    # 训练历史
-    np.savez(os.path.join(save_dir, "train_history.npz"),
-             train_loss=history['train_loss'],
-             val_loss=history['val_loss'],
-             lr=history['lr'])
-
-    # 保存测试集索引供评估使用
-    np.savez(os.path.join(save_dir, "split_indices.npz"),
-             train=train_idx, val=val_idx, test=test_idx)
-
-    print(f"\n训练完成，模型已保存到: {save_dir}")
-    print(f"  model.pth        — 模型权重")
-    print(f"  scaler.npz       — 标准化参数")
-    print(f"  train_config.json — 训练配置")
-    print(f"  train_history.npz — 训练曲线数据")
-    print(f"  split_indices.npz — 数据划分索引")
-
-    return save_dir
+    print(f"\n{'='*60}")
+    print(f"  全部训练完成")
+    print(f"  Vision-only  → {os.path.join(data_dir, 'model_output_vision_only')}")
+    print(f"  Vision+Piezo → {os.path.join(data_dir, 'model_output_vision_piezo')}")
+    print(f"{'='*60}")
 
 
 # ─────────────────────── 入口 ───────────────────────

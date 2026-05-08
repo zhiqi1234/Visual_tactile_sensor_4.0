@@ -66,8 +66,6 @@ def predict_all(model, dataset, indices, scaler, device):
         y_pred_norm = model(X_t).cpu().numpy()
 
     y_pred = y_pred_norm * scaler['y_std'] + scaler['y_mean']
-    if 'bias' in scaler:
-        y_pred -= scaler['bias']
     return y_raw, y_pred
 
 
@@ -204,33 +202,44 @@ def main():
                         help="多模态模型目录 (Vision+Piezo)")
     args = parser.parse_args()
 
-    # 如果未指定，弹出选择对话框
-    if args.baseline_dir is None or args.multimodal_dir is None:
-        from tkinter import Tk, filedialog
-        root = Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+    # 自动检测或手动指定模型目录
+    if args.data_dir is None:
+        args.data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "force_calibration")
 
-        if args.baseline_dir is None:
+    # 自动检测默认目录
+    default_baseline = os.path.join(args.data_dir, "model_output_vision_only")
+    default_multimodal = os.path.join(args.data_dir, "model_output_vision_piezo")
+
+    if args.baseline_dir is None:
+        if os.path.isdir(default_baseline):
+            args.baseline_dir = default_baseline
+        else:
+            from tkinter import Tk, filedialog
+            root = Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
             args.baseline_dir = filedialog.askdirectory(
                 title="选择基线模型目录 (Vision-only)",
-                initialdir=os.path.dirname(os.path.abspath(__file__))
-            )
+                initialdir=args.data_dir)
+            root.destroy()
 
-        if args.multimodal_dir is None:
+    if args.multimodal_dir is None:
+        if os.path.isdir(default_multimodal):
+            args.multimodal_dir = default_multimodal
+        else:
+            from tkinter import Tk, filedialog
+            root = Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
             args.multimodal_dir = filedialog.askdirectory(
                 title="选择多模态模型目录 (Vision+Piezo)",
-                initialdir=os.path.dirname(os.path.abspath(__file__))
-            )
+                initialdir=args.data_dir)
+            root.destroy()
 
-        root.destroy()
-
-        if not args.baseline_dir or not args.multimodal_dir:
-            print("未选择模型目录，退出")
-            return
-
-    if args.data_dir is None:
-        args.data_dir = os.path.dirname(args.baseline_dir)
+    if not args.baseline_dir or not args.multimodal_dir:
+        print("未找到模型目录，请先运行 V6_force_train.py 训练两个模型")
+        return
 
     print("=" * 60)
     print("V6 消融实验对比评估")

@@ -69,13 +69,12 @@ class ForcePredictor:
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = json.load(f)
 
-        # 加载 scaler + bias
+        # 加载 scaler
         sc = np.load(os.path.join(model_dir, "scaler.npz"))
         self.x_mean = sc['x_mean'].astype(np.float32)
         self.x_std = sc['x_std'].astype(np.float32)
         self.y_mean = sc['y_mean'].astype(np.float32)
         self.y_std = sc['y_std'].astype(np.float32)
-        self.bias = sc['bias'].astype(np.float32) if 'bias' in sc else np.zeros(6, dtype=np.float32)
 
         # 加载模型
         self.model = ForceMLP(
@@ -95,7 +94,6 @@ class ForcePredictor:
         self._x_std_t = torch.tensor(self.x_std, device=self.device)
         self._y_mean_t = torch.tensor(self.y_mean, device=self.device)
         self._y_std_t = torch.tensor(self.y_std, device=self.device)
-        self._bias_t = torch.tensor(self.bias, device=self.device)
 
         self.columns = ['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:self.config['output_dim']]
         print(f"[ForcePredictor] 模型已加载, 设备={self.device}, "
@@ -158,7 +156,7 @@ class ForcePredictor:
         with torch.no_grad():
             y_t = self.model(x_t)
 
-        y_t = y_t * self._y_std_t + self._y_mean_t - self._bias_t
+        y_t = y_t * self._y_std_t + self._y_mean_t
         return y_t.cpu().numpy()[0]
 
     def predict_batch(self, dxyz_batch, piezo_feat_batch=None):
@@ -197,7 +195,7 @@ class ForcePredictor:
         with torch.no_grad():
             y_t = self.model(x_t)
 
-        y_t = y_t * self._y_std_t + self._y_mean_t - self._bias_t
+        y_t = y_t * self._y_std_t + self._y_mean_t
         return y_t.cpu().numpy()
 
 

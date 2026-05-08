@@ -63,7 +63,6 @@ class ForcePredictor:
         self.x_std = sc['x_std'].astype(np.float32)
         self.y_mean = sc['y_mean'].astype(np.float32)
         self.y_std = sc['y_std'].astype(np.float32)
-        self.bias = sc['bias'].astype(np.float32) if 'bias' in sc else np.zeros(6, dtype=np.float32)
 
         self.model = LightNet(output_dim=self.config['output_dim']).to(self.device)
         self.model.load_state_dict(
@@ -75,7 +74,6 @@ class ForcePredictor:
         self._x_std_t = torch.tensor(self.x_std, device=self.device)
         self._y_mean_t = torch.tensor(self.y_mean, device=self.device)
         self._y_std_t = torch.tensor(self.y_std, device=self.device)
-        self._bias_t = torch.tensor(self.bias, device=self.device)
 
         self.columns = ['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:self.config['output_dim']]
         print(f"[ForcePredictor] LightNet已加载, 设备={self.device}, 输出={self.columns}")
@@ -89,7 +87,7 @@ class ForcePredictor:
         with torch.no_grad():
             y_t = self.model(x_t)
 
-        y_t = y_t * self._y_std_t + self._y_mean_t - self._bias_t
+        y_t = y_t * self._y_std_t + self._y_mean_t
         return y_t.cpu().numpy()[0]
 
     def predict_batch(self, dxyz_batch):
@@ -106,7 +104,7 @@ class ForcePredictor:
         with torch.no_grad():
             y_t = self.model(x_t)
 
-        y_t = y_t * self._y_std_t + self._y_mean_t - self._bias_t
+        y_t = y_t * self._y_std_t + self._y_mean_t
         return y_t.cpu().numpy()
 
 
