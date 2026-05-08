@@ -455,7 +455,7 @@ class V7MainWindow(QMainWindow):
 
         # 3D 视角
         self.view_elev = 90
-        self.view_azim = 180
+        self.view_azim = 0
         self.view_roll = -90
         self.view_saved = False
         self.is_dragging = False
@@ -1879,7 +1879,11 @@ class V7MainWindow(QMainWindow):
             matched.append((l_idx, r_idx))
         return matched
 
-    def build_coordinate_system_pca(self, points_3d):
+    def build_coordinate_system_pca(self, points_3d, prev_rotation=None):
+        """使用PCA构建坐标系。
+        prev_rotation: 上一次的旋转矩阵（3x3），用于约束主轴符号，防止随机翻转。
+        首次调用传 None，后续调用传已有的旋转矩阵。
+        """
         centroid = np.mean(points_3d, axis=0)
         centered = points_3d - centroid
         cov_matrix = np.cov(centered.T)
@@ -1889,16 +1893,28 @@ class V7MainWindow(QMainWindow):
         x_axis = eigenvectors[:, 0]
         y_axis = eigenvectors[:, 1]
         z_axis = eigenvectors[:, 2]
-        if z_axis[2] < 0:
-            z_axis = -z_axis
+
+        if prev_rotation is not None:
+            # 用前一次旋转矩阵的对应列约束符号：点积 < 0 说明方向相反，翻转
+            prev_x = prev_rotation[:, 0]
+            prev_z = prev_rotation[:, 2]
+            if np.dot(z_axis, prev_z) < 0:
+                z_axis = -z_axis
+            if np.dot(x_axis, prev_x) < 0:
+                x_axis = -x_axis
+        else:
+            # 首次初始化：用世界坐标系方向约束
+            if z_axis[2] < 0:
+                z_axis = -z_axis
+            if x_axis[0] < 0:
+                x_axis = -x_axis
+
+        # 重新正交化，保证右手系
         y_axis = np.cross(z_axis, x_axis)
         y_axis /= np.linalg.norm(y_axis)
         x_axis = np.cross(y_axis, z_axis)
         x_axis /= np.linalg.norm(x_axis)
-        # 固定 X 轴大致朝向，防止特征向量符号不确定性导致 X-Y 平面 180° 翻转
-        if x_axis[0] < 0:
-            x_axis = -x_axis
-            y_axis = -y_axis
+
         rotation_matrix = np.vstack([x_axis, y_axis, z_axis]).T
         return centroid, rotation_matrix
 
@@ -1906,7 +1922,11 @@ class V7MainWindow(QMainWindow):
         origin = self.FRAME_DATA['transform_origin']
         rotation = self.FRAME_DATA['transform_rotation']
         translated = points - origin
-        return np.dot(translated, rotation)
+        local = np.dot(translated, rotation)
+        # 绕 Z 轴旋转 180°：X、Y 取反，使点云方向与传感器视图一致
+        local[:, 0] = -local[:, 0]
+        local[:, 1] = -local[:, 1]
+        return local
 
     # ──────────────────── 显示 ────────────────────
 
@@ -2151,15 +2171,16 @@ class V7MainWindow(QMainWindow):
         points_3d = self.linear_triangulation(l_pts_ud, r_pts_ud, P1, P2)
         self.FRAME_DATA['base_3d_points'] = points_3d
 
+        # 重新计算 PCA 坐标系，传入上一次的旋转矩阵约束主轴符号，防止随机翻转
+        if len(points_3d) >= 3:
+            prev_rot = self.FRAME_DATA.get('transform_rotation')
+            origin, rotation_matrix = self.build_coordinate_system_pca(points_3d, prev_rotation=prev_rot)
+            self.FRAME_DATA['transform_origin'] = origin
+            self.FRAME_DATA['transform_rotation'] = rotation_matrix
+
         # 更新基准帧Delaunay拓扑边
         self.FRAME_DATA['left_edges'] = self.extract_edges(left_pts.astype(np.float64))
         self.FRAME_DATA['right_edges'] = self.extract_edges(right_pts.astype(np.float64))
-
-        # 重新计算坐标变换矩阵（与新基准帧匹配）
-        if len(points_3d) >= 3:
-            origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
-            self.FRAME_DATA['transform_origin'] = origin
-            self.FRAME_DATA['transform_rotation'] = rotation_matrix
 
         # 重置scatter对象，因为基准帧改变了
         self._scatter_plot = None

@@ -1,0 +1,21 @@
+{
+  "model_type": "LightNet",
+  "output_dim": 6,
+  "lr": 0.001,
+  "batch_size": 256,
+  "epochs_trained": 125,
+  "best_val_loss": 0.0834100366080118,
+  "noise_std": 0.01,
+  "concentration_weight": 1.0,
+  "train_val_files": [
+    "processed_calibration_20260423_150139.h5",
+    "processed_calibration_20260423_151429.h5",
+    "processed_calibration_20260423_152206.h5",
+    "processed_calibration_20260423_152805.h5",
+    "processed_calibration_20260423_153140.h5"
+  ],
+  "test_files": [
+    "processed_calibration_20260424_102051.h5"
+  ],
+  "timestamp": "20260426_182909"
+}

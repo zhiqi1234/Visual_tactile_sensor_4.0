@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(python -m py_compile V5_Vptac-force.py)",
-      "Bash(C:/Users/PC/AppData/Local/Programs/Python/Python310/python.exe -c:*)"
+      "Bash(C:/Users/PC/AppData/Local/Programs/Python/Python310/python.exe -c:*)",
+      "Bash(sed -n '2280,2292p' V5_Vptac-force.py)",
+      "Bash(sed -n '1921,1932p' V7_Vptac-force-predict.py)"
     ]
   }
 }

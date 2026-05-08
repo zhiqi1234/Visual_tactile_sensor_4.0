@@ -71,7 +71,8 @@ class PiezoSerialThread(QThread):
         self._last_clear_time = 0
 
         # 按ADC组分组的共享缓冲区：5组，每行 (timestamp, ch0..ch7)
-        self._group_bufs = [deque(maxlen=6000) for _ in range(self._N_GROUPS)]
+        # 预览窗口只保留最近5000帧用于波形显示
+        self._group_bufs = [deque(maxlen=5000) for _ in range(self._N_GROUPS)]
         self._buf_lock = threading.Lock()
 
         # 当前选中的ADC组和预览通道（主线程可随时改，int赋值原子安全）
@@ -81,6 +82,17 @@ class PiezoSerialThread(QThread):
         # 节流计数
         self._plot_counter = 0
         self._plot_interval = plot_interval
+
+        # 流式录制：采集期间直接追加写入，避免长时间采集内存溢出
+        self._recording = False             # 是否正在录制
+        self._record_bufs = [[] for _ in range(self._N_GROUPS)]  # 每组的待刷新缓冲
+        self._record_lock = threading.Lock()
+        self._record_filepath = None        # 当前录制文件路径（由主线程设置）
+        self._record_hdf_handle = None      # 打开的h5py文件句柄
+        self._record_ds_ts = [None] * self._N_GROUPS   # 各组 timestamp dataset
+        self._record_ds_val = [None] * self._N_GROUPS  # 各组 values dataset
+        self._flush_interval = 200          # 每积累多少帧就刷新一次到HDF5
+        self._flush_counter = 0
 
     # ── 主线程调用的接口 ──────────────────────────────────
 
@@ -191,11 +203,98 @@ class PiezoSerialThread(QThread):
             with self._buf_lock:
                 self._group_bufs[adc_group].append((ts, *voltages))  # (ts, v0..v7)
 
+            # 流式录制：采集期间将数据追加到待刷新缓冲
+            if self._recording:
+                with self._record_lock:
+                    self._record_bufs[adc_group].append((ts, *voltages))
+                self._flush_counter += 1
+                if self._flush_counter >= self._flush_interval:
+                    self._flush_counter = 0
+                    self._flush_to_hdf5()
+
             # 节流：每 _plot_interval 帧发一次刷新信号
             self._plot_counter += 1
             if self._plot_counter >= self._plot_interval:
                 self._plot_counter = 0
                 self.plot_ready.emit()
+
+    def start_streaming_record(self, filepath):
+        """开始流式录制，打开HDF5文件句柄（由主线程在采集开始时调用）"""
+        try:
+            f = h5py.File(filepath, 'a')  # 追加模式，文件可能已有其他组
+            self._record_hdf_handle = f
+            self._record_ds_ts = [None] * self._N_GROUPS
+            self._record_ds_val = [None] * self._N_GROUPS
+            # 预先在文件中创建可扩展的压电数据集
+            if 'piezo_stream' not in f:
+                pg = f.create_group('piezo_stream')
+                pg.attrs['n_channels'] = 8
+                pg.attrs['channel_names'] = 'CH1,CH2,CH3,CH4,CH5,CH6,CH7,CH8'
+                pg.attrs['unit'] = 'V'
+            pg = f['piezo_stream']
+            for g in range(self._N_GROUPS):
+                grp_name = f'adc{g+1}'
+                if grp_name not in pg:
+                    sub = pg.create_group(grp_name)
+                    sub.create_dataset('timestamp', shape=(0,), maxshape=(None,),
+                                       dtype=np.float64, chunks=(1000,))
+                    sub.create_dataset('values', shape=(0, 8), maxshape=(None, 8),
+                                       dtype=np.float32, chunks=(1000, 8))
+                self._record_ds_ts[g] = pg[grp_name]['timestamp']
+                self._record_ds_val[g] = pg[grp_name]['values']
+            # 清空待刷新缓冲
+            with self._record_lock:
+                self._record_bufs = [[] for _ in range(self._N_GROUPS)]
+            self._flush_counter = 0
+            self._record_filepath = filepath
+            self._recording = True
+            print(f"[PiezoSerialThread] 流式录制已开始: {filepath}")
+        except Exception as e:
+            print(f"[PiezoSerialThread] 流式录制启动失败: {e}")
+            self._recording = False
+
+    def stop_streaming_record(self):
+        """停止流式录制，刷新剩余数据并关闭文件（由主线程在采集停止时调用）"""
+        self._recording = False
+        # 最终刷新剩余数据
+        self._flush_to_hdf5(final=True)
+        if self._record_hdf_handle is not None:
+            try:
+                self._record_hdf_handle.close()
+            except Exception:
+                pass
+            self._record_hdf_handle = None
+        print("[PiezoSerialThread] 流式录制已停止")
+
+    def _flush_to_hdf5(self, final=False):
+        """将各组待刷新缓冲的数据追加写入HDF5（在采集线程内调用）"""
+        if self._record_hdf_handle is None:
+            return
+        for g in range(self._N_GROUPS):
+            with self._record_lock:
+                rows = self._record_bufs[g]
+                if not rows:
+                    continue
+                self._record_bufs[g] = []
+            # 转换
+            ts_arr = np.array([r[0] for r in rows], dtype=np.float64)
+            val_arr = np.array([r[1:] for r in rows], dtype=np.float32)
+            # 扩展 dataset
+            ds_ts = self._record_ds_ts[g]
+            ds_val = self._record_ds_val[g]
+            if ds_ts is None or ds_val is None:
+                continue
+            try:
+                n_old = ds_ts.shape[0]
+                n_new = len(ts_arr)
+                ds_ts.resize(n_old + n_new, axis=0)
+                ds_ts[n_old:] = ts_arr
+                ds_val.resize(n_old + n_new, axis=0)
+                ds_val[n_old:] = val_arr
+                if final:
+                    self._record_hdf_handle.flush()
+            except Exception as e:
+                print(f"[PiezoSerialThread] HDF5写入失败 ADC{g+1}: {e}")
 
     @staticmethod
     def _bytes_to_decimal(data):
@@ -471,7 +570,7 @@ class VideoPointCloudPlayer(QMainWindow):
 
         # 3D视角
         self.view_elev = 90
-        self.view_azim = 180
+        self.view_azim = 0
         self.view_roll = -90  # 添加roll参数，初始在XY平面顺时针旋转90°
         self.view_saved = False
         self.is_dragging = False
@@ -1488,8 +1587,13 @@ class VideoPointCloudPlayer(QMainWindow):
         self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
         self.FRAME_DATA['right_edges'] = self.extract_edges(pts2_R.astype(np.float64))
 
-        # 显示首帧
+        # 显示首帧（重置scatter状态，确保坐标轴以局部坐标系重建）
         self.current_frame_idx = 0
+        self._scatter_plot = None
+        self._colorbar = None
+        self._quiver_plot = None
+        self.fig_3d.clear()
+        self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
         self.display_frame(frame, pts1_R, pts2_R)
         self.update_3d_view(points_3d)
 
@@ -1557,9 +1661,10 @@ class VideoPointCloudPlayer(QMainWindow):
 
         self.FRAME_DATA['base_3d_points'] = points_3d
 
-        # 基准帧变化后，必须重新计算 PCA 局部坐标系（否则面会偏移/倾斜）
+        # 重新计算 PCA 坐标系，传入上一次的旋转矩阵约束主轴符号，防止随机翻转
         if len(points_3d) >= 3:
-            origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
+            prev_rot = self.FRAME_DATA.get('transform_rotation')
+            origin, rotation_matrix = self.build_coordinate_system_pca(points_3d, prev_rotation=prev_rot)
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
 
@@ -1597,9 +1702,17 @@ class VideoPointCloudPlayer(QMainWindow):
         self.recording_buffer = {'timestamps': [], 'xyz': [], 'abnormal': []}
         self.ft_recording_buffer = {'timestamps': [], 'ft_values': []}
 
-        # 清空压电缓冲区，记录采集起始时间
-        if self.piezo_thread is not None:
-            self.piezo_thread.clear_buffer()
+        # 提前生成文件名，供流式录制使用
+        start_time = datetime.now()
+        filename = f"calibration_{start_time.strftime('%Y%m%d_%H%M%S')}.h5"
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
+        os.makedirs(save_dir, exist_ok=True)
+        self._current_record_filepath = os.path.join(save_dir, filename)
+        self._current_record_filename = filename
+
+        # 启动压电流式录制（直接写HDF5，防止长时间采集数据丢失）
+        if self.piezo_thread is not None and self.piezo_thread.isRunning():
+            self.piezo_thread.start_streaming_record(self._current_record_filepath)
         self._piezo_record_start_ts = time.time()
 
         self.is_recording = True
@@ -1607,13 +1720,18 @@ class VideoPointCloudPlayer(QMainWindow):
         self.btn_record.setStyleSheet("background-color: #ff4444; color: white;")
         has_piezo = self.piezo_thread is not None and self.piezo_thread.isRunning()
         self.status_bar.showMessage(
-            f"数据采集中... {'(含压电8通道)' if has_piezo else '(无压电，可连接后再采集)'}")
+            f"数据采集中... {'(含压电8通道，流式写入)' if has_piezo else '(无压电，可连接后再采集)'}")
 
     def stop_recording(self):
         """停止数据采集并保存HDF5"""
         self.is_recording = False
         self.btn_record.setText("开始采集")
         self.btn_record.setStyleSheet("")
+
+        # 停止压电流式录制（刷新剩余缓冲并关闭文件句柄）
+        if self.piezo_thread is not None:
+            self.piezo_thread.stop_streaming_record()
+
         stop_time = datetime.now()
         self.save_to_hdf5(stop_time)
         self.save_ft_to_hdf5(stop_time)
@@ -1636,7 +1754,7 @@ class VideoPointCloudPlayer(QMainWindow):
         self.recording_buffer['abnormal'].append(is_abnormal)
 
     def save_to_hdf5(self, stop_time):
-        """将缓冲数据保存为HDF5文件"""
+        """将视觉缓冲数据追加保存到流式录制的HDF5文件（压电数据已由流式录制写入）"""
         if not self.recording_buffer['timestamps']:
             QMessageBox.warning(self, "警告", "没有采集到数据")
             self.status_bar.showMessage("采集已停止（无数据）")
@@ -1656,27 +1774,36 @@ class VideoPointCloudPlayer(QMainWindow):
         N = xyz_ref.shape[0]
         point_id = np.arange(N, dtype=np.int32)
 
-        # 获取压电数据快照（采集期间的全部8通道原始数据）
-        piezo_ts = None
-        piezo_vals = None
-        if self.piezo_thread is not None:
-            piezo_ts_raw, piezo_vals_raw = self.piezo_thread.get_recording_snapshot()
-            if len(piezo_ts_raw) > 0:
-                # 只保留采集开始之后的数据
-                mask = piezo_ts_raw >= self._piezo_record_start_ts
-                piezo_ts = piezo_ts_raw[mask]
-                piezo_vals = piezo_vals_raw[mask]  # (M, 8)
+        # 使用流式录制时已创建的文件（追加写入视觉数据）
+        filepath = getattr(self, '_current_record_filepath', None)
+        filename = getattr(self, '_current_record_filename', None)
+        if filepath is None:
+            # 兜底：若未启动流式录制（无压电），新建文件
+            filename = f"calibration_{stop_time.strftime('%Y%m%d_%H%M%S')}.h5"
+            save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
+            os.makedirs(save_dir, exist_ok=True)
+            filepath = os.path.join(save_dir, filename)
+            file_mode = 'w'
+        else:
+            file_mode = 'a'  # 追加到已有文件（压电流式数据已在其中）
 
-        # 时间戳自动命名，保存到代码同级目录下的 force_calibration 文件夹
-        filename = f"calibration_{stop_time.strftime('%Y%m%d_%H%M%S')}.h5"
-        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
-        os.makedirs(save_dir, exist_ok=True)
-        filepath = os.path.join(save_dir, filename)
+        # 统计压电帧数（从已写入的流式文件中读取）
+        piezo_sample_count = 0
+        if file_mode == 'a':
+            try:
+                with h5py.File(filepath, 'r') as f_r:
+                    if 'piezo_stream' in f_r:
+                        for g in range(5):
+                            grp_key = f'piezo_stream/adc{g+1}/timestamp'
+                            if grp_key in f_r:
+                                piezo_sample_count += f_r[grp_key].shape[0]
+            except Exception:
+                pass
 
         try:
-            with h5py.File(filepath, 'w') as f:
+            with h5py.File(filepath, file_mode) as f:
                 # /vision
-                vision = f.create_group('vision')
+                vision = f.require_group('vision')
                 vision.create_dataset('timestamp', data=timestamps)
                 vision.create_dataset('xyz', data=xyz_all)
                 vision.create_dataset('dxyz', data=dxyz)
@@ -1684,38 +1811,23 @@ class VideoPointCloudPlayer(QMainWindow):
                 vision.create_dataset('abnormal', data=abnormal)
 
                 # /reference
-                ref = f.create_group('reference')
-                ref.create_dataset('xyz_ref', data=xyz_ref)
+                ref = f.require_group('reference')
+                if 'xyz_ref' not in ref:
+                    ref.create_dataset('xyz_ref', data=xyz_ref)
 
                 # /meta
-                meta = f.create_group('meta')
+                meta = f.require_group('meta')
                 meta.attrs['camera_fps'] = self.spin_speed.value()
                 meta.attrs['marker_count'] = N
                 meta.attrs['experiment_name'] = filename
-                meta.attrs['has_piezo'] = (piezo_ts is not None and len(piezo_ts) > 0)
+                meta.attrs['has_piezo'] = (piezo_sample_count > 0)
 
                 # /force（预留扩展位置）
-                f.create_group('force')
-
-                # /piezo（当前选中ADC组的全部8通道原始数据）
-                if piezo_ts is not None and len(piezo_ts) > 0:
-                    pg_grp = f.create_group('piezo')
-                    pg_grp.create_dataset('timestamp', data=piezo_ts)
-                    pg_grp.create_dataset('values', data=piezo_vals)  # (M, 8)
-                    pg_grp.attrs['n_channels'] = 8
-                    pg_grp.attrs['channel_names'] = 'CH1,CH2,CH3,CH4,CH5,CH6,CH7,CH8'
-                    pg_grp.attrs['adc_group'] = self.piezo_adc_group + 1
-                    pg_grp.attrs['unit'] = 'V'
-                    if len(piezo_ts) > 1:
-                        dur = piezo_ts[-1] - piezo_ts[0]
-                        rate = (len(piezo_ts) - 1) / dur if dur > 0 else 0
-                        pg_grp.attrs['sample_rate_hz'] = round(rate, 1)
+                f.require_group('force')
 
             self.recording_buffer = {'timestamps': [], 'xyz': [], 'abnormal': []}
 
-            piezo_info = ""
-            if piezo_ts is not None and len(piezo_ts) > 0:
-                piezo_info = f"\n压电采样: {len(piezo_ts)} 点 × 8通道"
+            piezo_info = f"\n压电采样: {piezo_sample_count} 点 × 8通道（流式写入，全部ADC组）" if piezo_sample_count > 0 else ""
             QMessageBox.information(self, "保存成功",
                 f"数据已保存到:\n{filepath}\n\n帧数: {len(timestamps)}\nMarker数: {N}{piezo_info}")
             self.status_bar.showMessage(f"采集完成，已保存 {len(timestamps)} 帧到 {filename}")
@@ -2128,8 +2240,11 @@ class VideoPointCloudPlayer(QMainWindow):
 
         return matched
 
-    def build_coordinate_system_pca(self, points_3d):
-        """使用PCA构建坐标系"""
+    def build_coordinate_system_pca(self, points_3d, prev_rotation=None):
+        """使用PCA构建坐标系。
+        prev_rotation: 上一次的旋转矩阵（3x3），用于约束主轴符号，防止随机翻转。
+        首次调用传 None，后续调用传已有的旋转矩阵。
+        """
         centroid = np.mean(points_3d, axis=0)
         centered = points_3d - centroid
         cov_matrix = np.cov(centered.T)
@@ -2142,18 +2257,27 @@ class VideoPointCloudPlayer(QMainWindow):
         y_axis = eigenvectors[:, 1]
         z_axis = eigenvectors[:, 2]
 
-        if z_axis[2] < 0:
-            z_axis = -z_axis
+        if prev_rotation is not None:
+            # 用前一次旋转矩阵的对应列约束符号：点积 < 0 说明方向相反，翻转
+            prev_x = prev_rotation[:, 0]
+            prev_z = prev_rotation[:, 2]
+            if np.dot(z_axis, prev_z) < 0:
+                z_axis = -z_axis
+            if np.dot(x_axis, prev_x) < 0:
+                x_axis = -x_axis
+        else:
+            # 首次初始化：用世界坐标系 Z 轴方向约束（传感器法线大致朝 +Z）
+            if z_axis[2] < 0:
+                z_axis = -z_axis
+            # X 轴用世界坐标系 X 分量约束
+            if x_axis[0] < 0:
+                x_axis = -x_axis
 
+        # 重新正交化，保证右手系
         y_axis = np.cross(z_axis, x_axis)
         y_axis /= np.linalg.norm(y_axis)
         x_axis = np.cross(y_axis, z_axis)
         x_axis /= np.linalg.norm(x_axis)
-
-        # 固定 X 轴大致朝向，防止特征向量符号不确定性导致 X-Y 平面 180° 翻转
-        if x_axis[0] < 0:
-            x_axis = -x_axis
-            y_axis = -y_axis
 
         rotation_matrix = np.vstack([x_axis, y_axis, z_axis]).T
         return centroid, rotation_matrix
@@ -2163,7 +2287,11 @@ class VideoPointCloudPlayer(QMainWindow):
         origin = self.FRAME_DATA['transform_origin']
         rotation = self.FRAME_DATA['transform_rotation']
         translated = points - origin
-        return np.dot(translated, rotation)
+        result = np.dot(translated, rotation)
+        # 绕 Z 轴旋转 180°：X、Y 取反，使点云方向与传感器视图一致
+        result[:, 0] = -result[:, 0]
+        result[:, 1] = -result[:, 1]
+        return result
 
     def display_frame(self, frame, left_pts=None, right_pts=None, left_lost=None, right_lost=None):
         """显示帧"""
