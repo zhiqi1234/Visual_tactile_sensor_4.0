@@ -399,7 +399,7 @@ class V7MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("V7 - 点云实时显示 & 力预测")
-        self.setGeometry(50, 50, 1600, 1000)
+        self.setGeometry(50, 50, 1280, 800)
 
         # 路径变量
         self.calib_dir = None
@@ -652,7 +652,7 @@ class V7MainWindow(QMainWindow):
 
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        self.fig_3d = plt.figure(figsize=(5, 4))
+        self.fig_3d = plt.figure(figsize=(4, 3.5))
         self.ax_3d = self.fig_3d.add_subplot(111, projection='3d')
         self.canvas_3d = FigureCanvas(self.fig_3d)
         self.toolbar_3d = NavigationToolbar(self.canvas_3d, self)
@@ -684,7 +684,7 @@ class V7MainWindow(QMainWindow):
         force_layout.addLayout(btn_layout)
 
         # 6个力分量坐标轴（红色=实际力, 蓝色=预测力）
-        self.fig_force, self.axes_force = plt.subplots(2, 3, figsize=(15, 6))
+        self.fig_force, self.axes_force = plt.subplots(2, 3, figsize=(10, 5))
         self.canvas_force = FigureCanvas(self.fig_force)
         force_layout.addWidget(self.canvas_force)
 
@@ -693,21 +693,29 @@ class V7MainWindow(QMainWindow):
         # 压电信号实时波形（PyQtGraph）
         piezo_group = QGroupBox("压电信号实时波形")
         piezo_layout = QVBoxLayout(piezo_group)
-        piezo_layout.setContentsMargins(0, 0, 0, 0)
+        piezo_layout.setContentsMargins(4, 16, 4, 4)
 
         self.piezo_plot_widget = pg.GraphicsLayoutWidget()
         self.piezo_plot_widget.setBackground('w')
-        self.piezo_plot = self.piezo_plot_widget.addPlot(title="压电信号 (选中通道)")
-        self.piezo_plot.setYRange(-3.3, 3.3)
-        self.piezo_plot.setLabel('left', '电压 (V)')
-        self.piezo_plot.setLabel('bottom', '采样点')
-        self.piezo_plot.showGrid(x=True, y=True, alpha=0.3)
-        self.piezo_curve = self.piezo_plot.plot(pen=pg.mkPen('b', width=1))
+        self.piezo_plot_item = self.piezo_plot_widget.addPlot()
+        self.piezo_plot_item.setLabel('left', '电压 (V)')
+        self.piezo_plot_item.setLabel('bottom', '采样点')
+        self.piezo_plot_item.setYRange(-3.3, 3.3)
+        self.piezo_plot_item.showGrid(x=True, y=True, alpha=0.3)
+        self.piezo_plot_item.addLegend(offset=(10, 10))
+        # 当前预览通道曲线
+        self.piezo_curve_preview = self.piezo_plot_item.plot(
+            pen=pg.mkPen('#2196F3', width=2), name='预览通道')
+        # 状态标签（右上角显示通道名和采样率）
+        self.piezo_status_label = pg.LabelItem(
+            text='未连接', color='#666666', size='10pt')
+        self.piezo_plot_widget.addItem(self.piezo_status_label, row=0, col=1)
 
         piezo_layout.addWidget(self.piezo_plot_widget)
         main_splitter.addWidget(piezo_group)
 
-        main_splitter.setSizes([500, 400, 100])
+        # 分割比例：视觉区 5 : 力显示 3 : 压电波形 2
+        main_splitter.setSizes([450, 300, 200])
         main_layout.addWidget(main_splitter)
 
         # 状态栏
@@ -740,12 +748,16 @@ class V7MainWindow(QMainWindow):
         self.piezo_channel = index
         if self.piezo_thread is not None:
             self.piezo_thread.set_channel(index)
+        ch_name = f"CH{index + 1}"
+        self.piezo_plot_item.setTitle(f"压电信号 — ADC{self.piezo_adc_group + 1} {ch_name}")
 
     def _on_piezo_adc_group_changed(self, index):
         """ADC组切换：同步通知采集线程"""
         self.piezo_adc_group = index
         if self.piezo_thread is not None:
             self.piezo_thread.set_adc_group(index)
+        ch_name = f"CH{self.piezo_channel + 1}"
+        self.piezo_plot_item.setTitle(f"压电信号 — ADC{index + 1} {ch_name}")
 
     def toggle_piezo_connection(self):
         """切换压电传感器连接状态"""
@@ -763,11 +775,18 @@ class V7MainWindow(QMainWindow):
             self.piezo_thread.start()
 
             self.btn_piezo_connect.setText("断开压电")
+            self.btn_piezo_connect.setStyleSheet("background-color: #ff7043; color: white;")
+            ch_name = f"CH{self.piezo_channel + 1}"
+            self.piezo_plot_item.setTitle(f"压电信号 — ADC{self.piezo_adc_group + 1} {ch_name}")
+            self.piezo_status_label.setText(f'已连接 {port}')
             self.status_bar.showMessage(f"压电传感器已连接: {port} ADC{self.piezo_adc_group + 1}")
         else:
             self.piezo_thread.stop()
             self.piezo_thread = None
             self.btn_piezo_connect.setText("连接压电")
+            self.btn_piezo_connect.setStyleSheet("")
+            self.piezo_status_label.setText('未连接')
+            self.piezo_curve_preview.setData([])
             self.status_bar.showMessage("压电传感器已断开")
 
     def on_piezo_data(self, adc_group, voltages, timestamp):
@@ -782,7 +801,12 @@ class V7MainWindow(QMainWindow):
         if len(buf) == 0:
             return
         y_data = [v for _, v in buf]
-        self.piezo_curve.setData(y_data)
+        self.piezo_curve_preview.setData(y_data)
+        # 更新状态标签：显示缓冲区大小
+        with self.piezo_thread._buf_lock:
+            n = len(self.piezo_thread._group_bufs[self.piezo_thread._selected_adc_group])
+        self.piezo_status_label.setText(
+            f'ADC{self.piezo_adc_group + 1} CH{self.piezo_channel + 1}  |  缓冲: {n} 帧')
 
     def extract_realtime_piezo_features(self, current_timestamp=None):
         """从采集线程的缓冲区提取最新时间窗口的统计特征

@@ -11,7 +11,8 @@
       "Bash(python -m py_compile V6_force_predict_lightnet.py)",
       "Bash(python -m py_compile V6_force_predict.py)",
       "Bash(python -m py_compile V6_force_predict_pointnet.py)",
-      "Bash(python -m py_compile analyze_piezo_spectrum.py)"
+      "Bash(python -m py_compile analyze_piezo_spectrum.py)",
+      "Bash(python V6_force_eval_cross_model.py)"
     ]
   }
 }
