@@ -9,12 +9,13 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFileDialog, QTextEdit,
     QGroupBox, QSlider, QSpinBox, QDoubleSpinBox,
     QDockWidget, QListWidget, QAbstractItemView, QMessageBox,
-    QScrollBar, QSplitter, QComboBox,
+    QScrollBar, QSplitter, QComboBox, QCheckBox,
 )
 from PyQt5.QtCore import Qt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 import matplotlib.pyplot as plt
+from scipy import signal
 
 
 class HDF5Viewer(QMainWindow):
@@ -55,6 +56,7 @@ class HDF5Viewer(QMainWindow):
         self.piezo_channel = 0  # 当前选择的通道（0-7）
         self.piezo_adc_group = 1  # 当前选择的ADC组（0-4，默认ADC2）
         self.piezo_window_ms = 33  # 时间窗口（毫秒）
+        self.enable_notch_filter = True  # 50Hz陷波滤波
 
         # 文件导航
         self._current_dir = ""
@@ -332,6 +334,13 @@ class HDF5Viewer(QMainWindow):
         piezo_control_layout.addWidget(self.cbb_piezo_channel)
         piezo_control_layout.addWidget(lbl_piezo_window)
         piezo_control_layout.addWidget(self.spin_piezo_window)
+
+        self.chk_notch_filter = QCheckBox("50Hz滤波")
+        self.chk_notch_filter.setChecked(True)
+        self.chk_notch_filter.setToolTip("滤除50Hz工频干扰及其谐波(100/150Hz)")
+        self.chk_notch_filter.stateChanged.connect(self._on_filter_changed)
+
+        piezo_control_layout.addWidget(self.chk_notch_filter)
         piezo_control_layout.addStretch()
         main_layout.addWidget(piezo_control_group)
 
@@ -1601,19 +1610,66 @@ class HDF5Viewer(QMainWindow):
                 ts = grp['timestamp'][:]
                 raw_vals = grp['values'][:]  # (N, 8)
                 self.piezo_data['timestamp'] = ts
-                self.piezo_data['raw_values'] = raw_vals
+                self.piezo_data['raw_values'] = raw_vals  # 全通道原始数据
                 if raw_vals.ndim == 2 and raw_vals.shape[1] == 8:
-                    self.piezo_data['values'] = raw_vals[:, self.piezo_channel]
+                    clean = raw_vals[:, self.piezo_channel].astype(np.float64)
                     self.piezo_data['n_channels'] = 8
                 else:
-                    self.piezo_data['values'] = raw_vals
+                    clean = raw_vals.astype(np.float64).ravel()
                     self.piezo_data['n_channels'] = 1
+                self.piezo_data['values_clean'] = clean
+                self.piezo_data['values'] = self._apply_piezo_filters(clean, ts)
                 self.piezo_data['channel'] = self.piezo_channel + 1
                 self.piezo_data['adc_group'] = self.piezo_adc_group + 1
                 print(f"已从点云文件加载压电数据 (ADC{self.piezo_adc_group + 1}): "
                       f"{len(ts)} 采样, CH{self.piezo_channel + 1}")
         except Exception as e:
             print(f"加载压电数据失败: {e}")
+
+    # ── 压电滤波 ──
+
+    def _on_filter_changed(self, _=None):
+        """滤波复选框状态变化：从 clean 数据重新计算 filtered 并刷新波形"""
+        if not self.piezo_data or 'values_clean' not in self.piezo_data:
+            return
+        self.enable_notch_filter = self.chk_notch_filter.isChecked()
+        self.piezo_data['values'] = self._apply_piezo_filters(
+            self.piezo_data['values_clean'], self.piezo_data['timestamp'])
+        print(f"[滤波] 50Hz={'开' if self.enable_notch_filter else '关'}")
+        self.update_piezo_plot()
+
+    def _apply_piezo_filters(self, data, timestamps):
+        """对压电数据依次应用陷波滤波和尖峰去除
+
+        Args:
+            data: 1D 电压数组
+            timestamps: 时间戳数组（用于估算采样率）
+
+        Returns:
+            滤波后的 1D 数组
+        """
+        result = np.asarray(data, dtype=np.float64).copy()
+        if len(result) < 10:
+            return result
+
+        # 估算采样率（Windows time.time()精度有限，用总数/总时长）
+        fs = len(data) / max(timestamps[-1] - timestamps[0], 1e-9)
+        fs = min(fs, 20000.0)
+
+        # 50Hz 陷波滤波（含谐波 100Hz, 150Hz）
+        if self.enable_notch_filter:
+            for f0 in [50.0, 100.0, 150.0]:
+                if f0 >= fs / 2 - 1:
+                    break
+                try:
+                    b, a = signal.iirnotch(f0, 10.0, fs)
+                    result = signal.filtfilt(b, a, result)
+                except Exception:
+                    pass
+
+        return result
+
+    # ── 压电数据加载 / 切换 ──
 
     def _on_piezo_adc_group_changed(self, index):
         """ADC组切换：重新从点云文件加载对应ADC组的压电数据"""
@@ -1623,14 +1679,19 @@ class HDF5Viewer(QMainWindow):
         self.update_piezo_plot()
 
     def _on_piezo_channel_changed(self, index):
-        """压电通道切换：从已加载的8通道原始数据中取对应列"""
+        """压电通道切换：从已加载的8通道原始数据中取对应列并重新滤波"""
         self.piezo_channel = index
         if self.piezo_data and 'raw_values' in self.piezo_data:
             raw = self.piezo_data['raw_values']
             if raw.ndim == 2 and index < raw.shape[1]:
-                self.piezo_data['values'] = raw[:, index]
+                clean = raw[:, index].astype(np.float64)
             elif raw.ndim == 1:
-                self.piezo_data['values'] = raw
+                clean = raw.astype(np.float64).ravel()
+            else:
+                clean = raw.astype(np.float64)
+            self.piezo_data['values_clean'] = clean
+            self.piezo_data['values'] = self._apply_piezo_filters(
+                clean, self.piezo_data['timestamp'])
         self.update_piezo_plot()
 
     def _on_piezo_window_changed(self, value):
@@ -1754,11 +1815,6 @@ class HDF5Viewer(QMainWindow):
         if not name.startswith("processed_"):
             name = f"processed_{name}"
         filepath = os.path.join(save_dir, f"{name}{ext}")
-        # 若同名文件已存在，追加序号
-        counter = 1
-        while os.path.exists(filepath):
-            filepath = os.path.join(save_dir, f"{name}_{counter}{ext}")
-            counter += 1
 
         vision_ts = self.h5_data['timestamp']
         ft_ts = self.ft_data['timestamp']
