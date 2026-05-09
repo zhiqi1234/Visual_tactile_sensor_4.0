@@ -24,12 +24,12 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 # ─────────────────────── LightNet 模型 ───────────────────────
 
 class LightNet(nn.Module):
-    """轻量级点云网络：per-point Conv1d + dual pooling (max+mean)"""
-    def __init__(self, output_dim=6):
+    """轻量级点云网络：per-point Conv1d + dual pooling (max+mean)，可选压电特征注入"""
+    def __init__(self, output_dim=6, use_piezo=False):
         super().__init__()
         self.output_dim = output_dim
+        self.use_piezo = use_piezo
 
-        # Per-point feature extraction (轻量级)
         self.conv1 = nn.Conv1d(3, 32, 1)
         self.conv2 = nn.Conv1d(32, 64, 1)
         self.conv3 = nn.Conv1d(64, 128, 1)
@@ -37,35 +37,37 @@ class LightNet(nn.Module):
         self.bn2 = nn.BatchNorm1d(64)
         self.bn3 = nn.BatchNorm1d(128)
 
-        # Regression head (128*2=256 from dual pooling)
-        self.fc1 = nn.Linear(256, 128)
+        # Regression head: piezo features (5-dim) injected at global feature level
+        in_dim = 256 + (5 if use_piezo else 0)
+        self.fc1 = nn.Linear(in_dim, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, output_dim)
         self.bn4 = nn.BatchNorm1d(128)
         self.bn5 = nn.BatchNorm1d(64)
         self.dropout = nn.Dropout(p=0.2)
 
-    def forward(self, x):
+    def forward(self, x, piezo_feat=None):
         """
         Args:
             x: (B, N, 3) or (B, 3, N) point cloud
+            piezo_feat: (B, 5) optional piezo features
         Returns:
             out: (B, output_dim) predicted force
         """
         if x.dim() == 3 and x.size(2) == 3:
             x = x.transpose(2, 1)  # (B, N, 3) -> (B, 3, N)
 
-        # Per-point features
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         x = F.relu(self.bn3(self.conv3(x)))  # (B, 128, N)
 
-        # Dual pooling: max (尖锐物体) + mean (平面物体)
         max_feat = torch.max(x, 2)[0]  # (B, 128)
         mean_feat = torch.mean(x, 2)   # (B, 128)
         global_feat = torch.cat([max_feat, mean_feat], dim=1)  # (B, 256)
 
-        # Regression
+        if self.use_piezo and piezo_feat is not None:
+            global_feat = torch.cat([global_feat, piezo_feat], dim=1)
+
         x = F.relu(self.bn4(self.fc1(global_feat)))
         x = F.relu(self.bn5(self.fc2(x)))
         x = self.dropout(x)
@@ -79,12 +81,14 @@ class LightNet(nn.Module):
 class ForceDataset(Dataset):
     """从多个 processed HDF5 文件加载 dxyz → force 数据"""
 
-    def __init__(self, h5_files, force_dims=6, contact_threshold=0.02):
+    def __init__(self, h5_files, force_dims=6, contact_threshold=0.02, use_piezo=False):
         self.X = []  # dxyz (N, 60, 3)
+        self.P = []  # piezo features (N, 5)
         self.y = []  # force
         self.file_info = []
-        self.segment_info = []  # 记录每个segment的起止索引: [(start_idx, end_idx, file_idx), ...]
+        self.segment_info = []
         self.contact_threshold = contact_threshold
+        self.use_piezo = use_piezo
 
         for file_idx, fpath in enumerate(h5_files):
             with h5py.File(fpath, 'r') as f:
@@ -98,7 +102,6 @@ class ForceDataset(Dataset):
                 dxyz = dxyz[:T].astype(np.float32)
                 force = force[:T, :force_dims].astype(np.float32)
 
-                # 读取segments信息
                 segments = []
                 if 'segments' in f:
                     sg = f['segments']
@@ -109,7 +112,6 @@ class ForceDataset(Dataset):
                         segments.append((s, e))
                     print(f"[加载] {os.path.basename(fpath)}: 找到 {count} 个有效段")
 
-                # 读取时间戳（使用force/timestamp作为基准，因为segment是相对于它的）
                 timestamps = None
                 if 'force/timestamp' in f:
                     timestamps = f['force/timestamp'][:]
@@ -124,18 +126,26 @@ class ForceDataset(Dataset):
                     print(f"  [警告] 未找到timestamps，无法进行segment映射")
                 else:
                     print(f"  timestamps范围: {timestamps.min():.3f}s ~ {timestamps.max():.3f}s")
-                    # segment时间是相对于timestamps[0]的
                     t_rel = timestamps - timestamps[0]
+
+                # 加载压电特征
+                piezo_feat = None
+                if self.use_piezo and 'piezo/features' in f:
+                    piezo_feat = f['piezo/features'][:T].astype(np.float32)
+                    if piezo_feat.shape[0] == T:
+                        print(f"  [压电特征] 已加载: {piezo_feat.shape}")
+                    else:
+                        piezo_feat = None
 
                 offset = sum(info[1] for info in self.file_info)
                 self.X.append(dxyz)
                 self.y.append(force)
+                if piezo_feat is not None:
+                    self.P.append(piezo_feat)
                 self.file_info.append((os.path.basename(fpath), T, offset))
 
-                # 记录每个segment对应的帧索引范围
                 if segments and timestamps is not None:
                     for seg_idx, (seg_start_time, seg_end_time) in enumerate(segments):
-                        # 找到时间戳在segment范围内的帧（使用相对时间）
                         mask = (t_rel >= seg_start_time) & (t_rel <= seg_end_time)
                         indices = np.where(mask)[0]
                         if len(indices) > 0:
@@ -152,12 +162,18 @@ class ForceDataset(Dataset):
 
         self.X = np.concatenate(self.X, axis=0)
         self.y = np.concatenate(self.y, axis=0)
+        self.has_piezo = len(self.P) > 0
+        if self.has_piezo:
+            self.P = np.concatenate(self.P, axis=0)
+        else:
+            self.P = np.zeros((len(self.X), 5), dtype=np.float32)
 
-        # 计算集中度（用于损失加权，尖锐物体权重更高）
         self.concentrations = self._compute_concentrations()
 
         self.x_mean = None
         self.x_std = None
+        self.p_mean = None
+        self.p_std = None
         self.y_mean = None
         self.y_std = None
 
@@ -165,6 +181,8 @@ class ForceDataset(Dataset):
         print(f"输入shape: {self.X.shape}, 输出shape: {self.y.shape}")
         print(f"力范围: {self.y.min(axis=0)} ~ {self.y.max(axis=0)}")
         print(f"总segment数: {len(self.segment_info)}")
+        if self.use_piezo:
+            print(f"压电特征: {'已加载' if self.has_piezo else '无数据，填零'}")
 
     def _compute_concentrations(self):
         """计算每个样本的位移集中度（max/mean，尖锐物体集中度高）"""
@@ -243,6 +261,12 @@ class ForceDataset(Dataset):
         self.x_std = X_sub.std(axis=0).reshape(60, 3)
         self.x_std[self.x_std < 1e-8] = 1.0
 
+        if self.use_piezo:
+            P_sub = self.P[indices]
+            self.p_mean = P_sub.mean(axis=0)
+            self.p_std = P_sub.std(axis=0)
+            self.p_std[self.p_std < 1e-8] = 1.0
+
         self.y_mean = y_sub.mean(axis=0)
         self.y_std = y_sub.std(axis=0)
         self.y_std[self.y_std < 1e-8] = 1.0
@@ -254,6 +278,9 @@ class ForceDataset(Dataset):
         self.x_std = scaler['x_std']
         self.y_mean = scaler['y_mean']
         self.y_std = scaler['y_std']
+        if self.use_piezo:
+            self.p_mean = scaler.get('p_mean', np.zeros(5, dtype=np.float32))
+            self.p_std = scaler.get('p_std', np.ones(5, dtype=np.float32))
 
     def __len__(self):
         return len(self.X)
@@ -264,6 +291,12 @@ class ForceDataset(Dataset):
         x_norm = (self.X[idx] - self.x_mean) / self.x_std
         y_norm = (self.y[idx] - self.y_mean) / self.y_std
         concentration = self.concentrations[idx]
+        if self.use_piezo:
+            p_norm = (self.P[idx] - self.p_mean) / self.p_std
+            return (torch.tensor(x_norm, dtype=torch.float32),
+                    torch.tensor(y_norm, dtype=torch.float32),
+                    torch.tensor(concentration, dtype=torch.float32),
+                    torch.tensor(p_norm, dtype=torch.float32))
         return (torch.tensor(x_norm, dtype=torch.float32),
                 torch.tensor(y_norm, dtype=torch.float32),
                 torch.tensor(concentration, dtype=torch.float32))
@@ -271,10 +304,14 @@ class ForceDataset(Dataset):
     def get_scaler(self):
         if self.x_mean is None:
             raise RuntimeError("未设置 scaler")
-        return {
+        sc = {
             'x_mean': self.x_mean, 'x_std': self.x_std,
             'y_mean': self.y_mean, 'y_std': self.y_std,
         }
+        if self.use_piezo:
+            sc['p_mean'] = self.p_mean
+            sc['p_std'] = self.p_std
+        return sc
 
 
 # ─────────────────────── 数据增强 ───────────────────────
@@ -289,10 +326,11 @@ class AugmentedSubset(Dataset):
         return len(self.subset)
 
     def __getitem__(self, idx):
-        x, y, concentration = self.subset[idx]
+        item = self.subset[idx]
+        x = item[0]
         if self.noise_std > 0:
             x = x + torch.randn_like(x) * self.noise_std
-        return x, y, concentration
+        return (x,) + item[1:]
 
 
 # ─────────────────────── 训练逻辑 ───────────────────────
@@ -428,186 +466,199 @@ def train(args):
             sys.exit(1)
         train_val_files = h5_files
         test_files = []
+        piezo_modes = [args.use_piezo]
+        print(f"[非交互模式] 所有 {len(h5_files)} 个文件用于训练+验证")
     else:
-        # 使用编号选择方式
         data_dir = args.data_dir
         train_val_files, test_files, data_dir = select_files_by_number(data_dir)
-
-    if not train_val_files:
-        print("未选择任何训练文件，退出")
-        sys.exit(1)
+        if not train_val_files:
+            print("未选择任何训练文件，退出")
+            sys.exit(1)
+        piezo_modes = [False, True]
 
     if data_dir is None:
         data_dir = os.path.dirname(train_val_files[0])
 
-    # 加载数据
     all_files = train_val_files + [f for f in test_files if f not in train_val_files]
-    dataset = ForceDataset(all_files, force_dims=args.force_dims)
 
-    # 划分数据（使用基于segment的划分方式）
-    train_idx, val_idx = dataset.get_segment_based_split(train_ratio=0.8, group_size=10)
+    for use_piezo in piezo_modes:
+        label = "Vision+Piezo" if use_piezo else "Vision-only"
+        subdir = "model_output_lightnet_piezo" if use_piezo else "model_output_lightnet"
+        save_dir = os.path.join(data_dir, subdir)
 
-    # 处理测试集
-    test_idx = []
-    if test_files:
-        test_fnames = set(os.path.basename(f) for f in test_files)
-        for fname, n_frames, offset in dataset.file_info:
-            if fname in test_fnames:
-                test_idx.extend(range(offset, offset + n_frames))
-                print(f"  {fname}: test={n_frames} (整段)")
+        print(f"\n{'='*60}")
+        print(f"  训练 LightNet {label} 模型 → {subdir}/")
+        print(f"{'='*60}")
 
-    # 计算scaler
-    dataset.compute_scaler(train_idx)
-    scaler = dataset.get_scaler()
-    train_set = Subset(dataset, train_idx)
-    val_set = Subset(dataset, val_idx)
+        dataset = ForceDataset(all_files, force_dims=args.force_dims, use_piezo=use_piezo)
 
-    # 数据增强
-    if args.noise_std > 0:
-        print(f"数据增强: noise_std={args.noise_std}")
-        train_set = AugmentedSubset(train_set, noise_std=args.noise_std)
+        train_idx, val_idx = dataset.get_segment_based_split(train_ratio=0.8, group_size=10)
+        test_idx = []
+        if test_files:
+            test_fnames = set(os.path.basename(f) for f in test_files)
+            for fname, n_frames, offset in dataset.file_info:
+                if fname in test_fnames:
+                    test_idx.extend(range(offset, offset + n_frames))
+                    print(f"  {fname}: test={n_frames} (整段)")
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
+        dataset.compute_scaler(train_idx)
+        scaler = dataset.get_scaler()
+        train_set = Subset(dataset, train_idx)
+        val_set = Subset(dataset, val_idx)
 
-    # 模型
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n使用设备: {device}")
+        if args.noise_std > 0:
+            print(f"数据增强: noise_std={args.noise_std}")
+            train_set = AugmentedSubset(train_set, noise_std=args.noise_std)
 
-    model = LightNet(output_dim=args.force_dims).to(device)
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+        train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    # 训练配置
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    if args.scheduler == 'cosine':
-        scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
-    else:
-        scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"\n使用设备: {device}")
 
-    criterion = nn.MSELoss(reduction='none')
+        model = LightNet(output_dim=args.force_dims, use_piezo=use_piezo).to(device)
+        print(f"模型参数量: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 训练循环
-    best_val_loss = float('inf')
-    patience_counter = 0
-    history = {'train_loss': [], 'val_loss': [], 'lr': []}
-
-    save_dir = os.path.join(data_dir, "model_output_lightnet")
-    os.makedirs(save_dir, exist_ok=True)
-
-    for epoch in range(1, args.epochs + 1):
-        # Train
-        model.train()
-        train_loss = 0.0
-        for xb, yb, concentration in train_loader:
-            xb, yb, concentration = xb.to(device), yb.to(device), concentration.to(device)
-            pred = model(xb)
-
-            # 集中度加权：尖锐物体(高集中度)权重更高，平衡训练
-            loss_per_sample = criterion(pred, yb).mean(dim=1)
-            # 归一化集中度到[0,1]，然后反转（低集中度=平面=低权重）
-            conc_norm = (concentration - 1.0) / 2.0  # 假设集中度范围1-3
-            conc_norm = torch.clamp(conc_norm, 0, 1)
-            weight = 1.0 + args.concentration_weight * conc_norm
-            loss = (loss_per_sample * weight).mean()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * xb.size(0)
-        train_loss /= len(train_set)
-
-        # Validate
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for xb, yb, _ in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                pred = model(xb)
-                loss = criterion(pred, yb).mean()
-                val_loss += loss.item() * xb.size(0)
-        val_loss /= len(val_set)
-
-        current_lr = optimizer.param_groups[0]['lr']
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss)
-        history['lr'].append(current_lr)
-
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         if args.scheduler == 'cosine':
-            scheduler.step()
+            scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
         else:
-            scheduler.step(val_loss)
+            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
-        if epoch % 10 == 0 or epoch == 1:
-            print(f"Epoch {epoch:4d}/{args.epochs}  "
-                  f"train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  lr={current_lr:.2e}")
+        criterion = nn.MSELoss(reduction='none')
 
-        # Early stopping
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), os.path.join(save_dir, "model.pth"))
+        best_val_loss = float('inf')
+        patience_counter = 0
+        history = {'train_loss': [], 'val_loss': [], 'lr': []}
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        for epoch in range(1, args.epochs + 1):
+            model.train()
+            train_loss = 0.0
+            for batch in train_loader:
+                xb = batch[0].to(device)
+                yb = batch[1].to(device)
+                concentration = batch[2].to(device)
+                pb = batch[3].to(device) if (use_piezo and len(batch) > 3) else None
+
+                pred = model(xb, pb)
+                loss_per_sample = criterion(pred, yb).mean(dim=1)
+                conc_norm = (concentration - 1.0) / 2.0
+                conc_norm = torch.clamp(conc_norm, 0, 1)
+                weight = 1.0 + args.concentration_weight * conc_norm
+                loss = (loss_per_sample * weight).mean()
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * xb.size(0)
+            train_loss /= len(train_set)
+
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for batch in val_loader:
+                    xb = batch[0].to(device)
+                    yb = batch[1].to(device)
+                    pb = batch[3].to(device) if (use_piezo and len(batch) > 3) else None
+                    pred = model(xb, pb)
+                    loss = criterion(pred, yb).mean()
+                    val_loss += loss.item() * xb.size(0)
+            val_loss /= len(val_set)
+
+            current_lr = optimizer.param_groups[0]['lr']
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            history['lr'].append(current_lr)
+
+            if args.scheduler == 'cosine':
+                scheduler.step()
+            else:
+                scheduler.step(val_loss)
+
+            if epoch % 10 == 0 or epoch == 1:
+                print(f"Epoch {epoch:4d}/{args.epochs}  "
+                      f"train_loss={train_loss:.6f}  val_loss={val_loss:.6f}  lr={current_lr:.2e}")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                torch.save(model.state_dict(), os.path.join(save_dir, "model.pth"))
+            else:
+                patience_counter += 1
+                if patience_counter >= args.patience:
+                    print(f"\nEarly stopping at epoch {epoch}, best val_loss={best_val_loss:.6f}")
+                    break
+
+        # 零点偏置校正
+        model.load_state_dict(torch.load(os.path.join(save_dir, "model.pth")))
+        model.eval()
+
+        zero_threshold = {'fx': 0.3, 'fy': 0.3, 'fz': 0.5, 'mx': 0.01, 'my': 0.01, 'mz': 0.005}
+        zero_mask = np.ones(len(val_idx), dtype=bool)
+        for i, dim_name in enumerate(['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:args.force_dims]):
+            zero_mask &= (np.abs(dataset.y[val_idx, i]) < zero_threshold[dim_name])
+
+        if zero_mask.sum() > 10:
+            zero_indices = np.array(val_idx)[zero_mask]
+            zero_set = Subset(dataset, zero_indices.tolist())
+            zero_loader = DataLoader(zero_set, batch_size=args.batch_size, shuffle=False)
+            preds = []
+            with torch.no_grad():
+                for batch in zero_loader:
+                    xb = batch[0].to(device)
+                    pb = batch[3].to(device) if (use_piezo and len(batch) > 3) else None
+                    pred = model(xb, pb)
+                    pred = pred.cpu().numpy() * scaler['y_std'] + scaler['y_mean']
+                    preds.append(pred)
+            bias = np.concatenate(preds, axis=0).mean(axis=0)
+            print(f"\n零点偏置校正 (基于{zero_mask.sum()}个零点样本):")
+            for i, name in enumerate(['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:args.force_dims]):
+                print(f"  {name}: {bias[i]:.4f}")
         else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                print(f"\nEarly stopping at epoch {epoch}, best val_loss={best_val_loss:.6f}")
-                break
+            bias = np.zeros(args.force_dims)
 
-    # 零点偏置校正
-    model.load_state_dict(torch.load(os.path.join(save_dir, "model.pth")))
-    model.eval()
+        # 保存
+        np.savez(os.path.join(save_dir, "scaler.npz"), **scaler, bias=bias)
 
-    zero_threshold = {'fx': 0.3, 'fy': 0.3, 'fz': 0.5, 'mx': 0.01, 'my': 0.01, 'mz': 0.005}
-    zero_mask = np.ones(len(val_idx), dtype=bool)
-    for i, dim_name in enumerate(['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:args.force_dims]):
-        zero_mask &= (np.abs(dataset.y[val_idx, i]) < zero_threshold[dim_name])
+        config = {
+            'model_type': 'LightNet',
+            'output_dim': args.force_dims,
+            'use_piezo': use_piezo,
+            'lr': args.lr,
+            'batch_size': args.batch_size,
+            'epochs_trained': epoch,
+            'best_val_loss': float(best_val_loss),
+            'noise_std': args.noise_std,
+            'concentration_weight': args.concentration_weight,
+            'scheduler': args.scheduler,
+            'train_val_files': [os.path.basename(f) for f in train_val_files],
+            'test_files': [os.path.basename(f) for f in test_files],
+            'total_samples': len(dataset),
+            'train_samples': len(train_idx),
+            'val_samples': len(val_idx),
+            'test_samples': len(test_idx),
+            'timestamp': datetime.now().strftime('%Y%m%d_%H%M%S'),
+        }
+        with open(os.path.join(save_dir, "train_config.json"), 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
 
-    if zero_mask.sum() > 10:
-        zero_indices = np.array(val_idx)[zero_mask]
-        zero_loader = DataLoader(Subset(dataset, zero_indices.tolist()),
-                                batch_size=args.batch_size, shuffle=False)
-        preds = []
-        with torch.no_grad():
-            for xb, _, _ in zero_loader:
-                pred = model(xb.to(device))
-                pred = pred.cpu().numpy() * scaler['y_std'] + scaler['y_mean']
-                preds.append(pred)
+        np.savez(os.path.join(save_dir, "train_history.npz"),
+                 train_loss=history['train_loss'],
+                 val_loss=history['val_loss'],
+                 lr=history['lr'])
 
-        bias = np.concatenate(preds, axis=0).mean(axis=0)
-        print(f"\n零点偏置校正 (基于{zero_mask.sum()}个零点样本):")
-        for i, name in enumerate(['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:args.force_dims]):
-            print(f"  {name}: {bias[i]:.4f}")
-    else:
-        bias = np.zeros(args.force_dims)
+        np.savez(os.path.join(save_dir, "split_indices.npz"),
+                 train=train_idx, val=val_idx, test=test_idx)
 
-    # 保存
-    np.savez(os.path.join(save_dir, "scaler.npz"), **scaler, bias=bias)
+        print(f"\n{label} 训练完成 → {save_dir}")
 
-    config = {
-        'model_type': 'LightNet',
-        'output_dim': args.force_dims,
-        'lr': args.lr,
-        'batch_size': args.batch_size,
-        'epochs_trained': epoch,
-        'best_val_loss': float(best_val_loss),
-        'noise_std': args.noise_std,
-        'concentration_weight': args.concentration_weight,
-        'train_val_files': [os.path.basename(f) for f in train_val_files],
-        'test_files': [os.path.basename(f) for f in test_files],
-        'timestamp': datetime.now().strftime('%Y%m%d_%H%M%S'),
-    }
-    with open(os.path.join(save_dir, "train_config.json"), 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
-
-    np.savez(os.path.join(save_dir, "train_history.npz"),
-             train_loss=history['train_loss'],
-             val_loss=history['val_loss'],
-             lr=history['lr'])
-
-    np.savez(os.path.join(save_dir, "split_indices.npz"),
-             train=train_idx, val=val_idx, test=test_idx)
-
-    print(f"\n训练完成，模型已保存到: {save_dir}")
-    return save_dir
+    print(f"\n{'='*60}")
+    print(f"  全部训练完成")
+    print(f"  Vision-only  → {os.path.join(data_dir, 'model_output_lightnet')}")
+    print(f"  Vision+Piezo → {os.path.join(data_dir, 'model_output_lightnet_piezo')}")
+    print(f"{'='*60}")
 
 
 def main():
@@ -627,6 +678,8 @@ def main():
     parser.add_argument('--scheduler', type=str, default='plateau',
                         choices=['plateau', 'cosine'])
     parser.add_argument('--no_interact', action='store_true')
+    parser.add_argument('--use_piezo', action='store_true',
+                        help="使用压电特征（需要processed文件中包含/piezo/features）")
 
     args = parser.parse_args()
     train(args)

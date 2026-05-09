@@ -542,7 +542,7 @@ class HDF5Viewer(QMainWindow):
             self._update_nav_buttons()
 
     def _auto_load_force_file(self, filepath):
-        """自动加载对应的力觉文件（根据时间戳就近匹配）"""
+        """自动加载对应的力觉文件（按实际时间戳重叠匹配，避免文件名时间差导致的错配）"""
         basename = os.path.basename(filepath)
         dirpath = os.path.dirname(filepath)
         if not basename.startswith("calibration_") or basename.startswith("ft_"):
@@ -555,29 +555,39 @@ class HDF5Viewer(QMainWindow):
                 self.statusBar().currentMessage() +
                 f"  |  自动加载力觉文件: {os.path.basename(ft_path)}")
             return
-        # 2) 扫描目录，按文件名中的时间戳就近匹配
+        # 2) 读取点云时间戳范围
+        try:
+            with h5py.File(filepath, 'r') as f:
+                if 'vision/timestamp' not in f:
+                    return
+                v_ts = f['vision/timestamp'][:]
+                v_start, v_end = v_ts[0], v_ts[-1]
+        except Exception:
+            return
+        # 3) 扫描ft文件，按时间戳重叠量匹配（而非文件名字符串距离）
         import glob
-        import re
         ft_candidates = sorted(glob.glob(os.path.join(dirpath, "ft_calibration_*.h5")))
         if not ft_candidates:
             return
-        # 从点云文件名提取时间戳
-        m = re.search(r'(\d{8}_\d{6})', basename)
-        if m:
-            pc_ts = m.group(1)
-            best, best_dist = None, float('inf')
-            for cand in ft_candidates:
-                cm = re.search(r'(\d{8}_\d{6})', os.path.basename(cand))
-                if cm:
-                    dist = abs(int(cm.group(1).replace('_', '')) - int(pc_ts.replace('_', '')))
-                    if dist < best_dist:
-                        best_dist = dist
+        best, best_overlap = None, 0
+        for cand in ft_candidates:
+            try:
+                with h5py.File(cand, 'r') as f:
+                    if 'force/timestamp' not in f:
+                        continue
+                    ft_ts = f['force/timestamp'][:]
+                    ft_start, ft_end = ft_ts[0], ft_ts[-1]
+                    overlap = min(v_end, ft_end) - max(v_start, ft_start)
+                    if overlap > best_overlap:
+                        best_overlap = overlap
                         best = cand
-            if best is not None:
-                self.load_force_file(best)
-                self.statusBar().showMessage(
-                    self.statusBar().currentMessage() +
-                    f"  |  自动加载力觉文件: {os.path.basename(best)}")
+            except Exception:
+                continue
+        if best is not None and best_overlap > 0:
+            self.load_force_file(best)
+            self.statusBar().showMessage(
+                self.statusBar().currentMessage() +
+                f"  |  自动加载力觉文件: {os.path.basename(best)}")
 
     def open_file(self):
         filepath, _ = QFileDialog.getOpenFileName(

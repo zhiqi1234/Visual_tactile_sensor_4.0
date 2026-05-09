@@ -33,8 +33,9 @@ def load_model_and_data(model_dir, data_dir):
                                      map_location=device, weights_only=True))
     model.eval()
 
+    use_piezo = config.get('use_piezo', False)
     h5_files = sorted(glob.glob(os.path.join(data_dir, "processed_*.h5")))
-    dataset = ForceDataset(h5_files, force_dims=config['output_dim'])
+    dataset = ForceDataset(h5_files, force_dims=config['output_dim'], use_piezo=use_piezo)
     dataset.set_scaler(scaler)
 
     sp = np.load(os.path.join(model_dir, "split_indices.npz"), allow_pickle=True)
@@ -45,14 +46,20 @@ def load_model_and_data(model_dir, data_dir):
 
 def predict_all(model, dataset, indices, scaler, device):
     model.eval()
-    X_raw = dataset.X[indices]  # (N, 60, 3)
+    X_raw = dataset.X[indices]
     y_raw = dataset.y[indices]
 
     X_norm = (X_raw - scaler['x_mean'].reshape(60, 3)) / scaler['x_std'].reshape(60, 3)
     X_t = torch.tensor(X_norm, dtype=torch.float32).to(device)
 
+    P_t = None
+    if model.use_piezo:
+        P_raw = dataset.P[indices]
+        P_norm = (P_raw - scaler['p_mean']) / scaler['p_std']
+        P_t = torch.tensor(P_norm, dtype=torch.float32).to(device)
+
     with torch.no_grad():
-        y_pred_norm = model(X_t).cpu().numpy()
+        y_pred_norm = model(X_t, P_t).cpu().numpy()
 
     y_pred = y_pred_norm * scaler['y_std'] + scaler['y_mean']
     if 'bias' in scaler:

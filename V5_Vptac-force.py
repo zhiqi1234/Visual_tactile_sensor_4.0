@@ -1702,8 +1702,9 @@ class VideoPointCloudPlayer(QMainWindow):
         self.recording_buffer = {'timestamps': [], 'xyz': [], 'abnormal': []}
         self.ft_recording_buffer = {'timestamps': [], 'ft_values': []}
 
-        # 提前生成文件名，供流式录制使用
+        # 提前生成文件名，供流式录制和力觉文件使用（两者使用相同时间戳）
         start_time = datetime.now()
+        self._current_record_start_time = start_time
         filename = f"calibration_{start_time.strftime('%Y%m%d_%H%M%S')}.h5"
         save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
         os.makedirs(save_dir, exist_ok=True)
@@ -1848,7 +1849,8 @@ class VideoPointCloudPlayer(QMainWindow):
         timestamps = np.array(ft_timestamps, dtype=np.float64)
         values = np.array(ft_values, dtype=np.float64)  # (T, 6)
 
-        filename = f"ft_calibration_{stop_time.strftime('%Y%m%d_%H%M%S')}.h5"
+        start_time = getattr(self, '_current_record_start_time', stop_time)
+        filename = f"ft_calibration_{start_time.strftime('%Y%m%d_%H%M%S')}.h5"
         save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_calibration")
         os.makedirs(save_dir, exist_ok=True)
         filepath = os.path.join(save_dir, filename)

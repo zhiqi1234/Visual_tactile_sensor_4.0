@@ -1,0 +1,36 @@
+{
+  "input_dim": 189,
+  "output_dim": 6,
+  "hidden_dims": [
+    512,
+    256,
+    128
+  ],
+  "dropout": [
+    0.2,
+    0.1,
+    0.0
+  ],
+  "lr": 0.0005,
+  "batch_size": 256,
+  "epochs_trained": 70,
+  "best_val_loss": 0.031260029768928346,
+  "device": "cpu",
+  "noise_std": 0.01,
+  "scheduler": "plateau",
+  "train_val_files": [
+    "processed_calibration_20260509_175756.h5",
+    "processed_calibration_20260509_180422.h5",
+    "processed_calibration_20260509_180917.h5",
+    "processed_calibration_20260509_181250.h5"
+  ],
+  "test_files": [
+    "processed_calibration_20260509_181714.h5"
+  ],
+  "total_samples": 10123,
+  "train_samples": 9158,
+  "val_samples": 965,
+  "test_samples": 2055,
+  "use_piezo": false,
+  "timestamp": "20260509_190537"
+}

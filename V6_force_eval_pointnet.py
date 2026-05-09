@@ -46,9 +46,10 @@ def load_model_and_data(model_dir, data_dir):
     model.eval()
 
     # 数据
+    use_piezo = config.get('use_piezo', False)
     h5_files = sorted(glob.glob(os.path.join(data_dir, "processed_*.h5")))
-    dataset = ForceDataset(h5_files, force_dims=config['output_dim'])
-    dataset.set_scaler(scaler)  # 使用训练时保存的 scaler
+    dataset = ForceDataset(h5_files, force_dims=config['output_dim'], use_piezo=use_piezo)
+    dataset.set_scaler(scaler)
 
     # 划分索引
     sp = np.load(os.path.join(model_dir, "split_indices.npz"), allow_pickle=True)
@@ -63,22 +64,25 @@ def predict_all(model, dataset, indices, scaler, device):
     X_raw = dataset.X[indices]
     y_raw = dataset.y[indices]
 
-    # 使用训练集的 scaler 做标准化
     X_norm = (X_raw - scaler['x_mean']) / scaler['x_std']
 
-    # PointNet 输入格式: (B, 3, N)，分批处理
+    use_piezo = model.use_piezo
+    P_norm = None
+    if use_piezo:
+        P_raw = dataset.P[indices]
+        P_norm = (P_raw - scaler['p_mean']) / scaler['p_std']
+
     batch_size = 32
     y_pred_list = []
 
     with torch.no_grad():
         for i in range(0, len(X_norm), batch_size):
             X_batch = torch.tensor(X_norm[i:i+batch_size], dtype=torch.float32).to(device)
-            y_batch, _ = model(X_batch)  # 解包 (pred, trans_feat)
+            P_batch = torch.tensor(P_norm[i:i+batch_size], dtype=torch.float32).to(device) if use_piezo else None
+            y_batch, _ = model(X_batch, P_batch)
             y_pred_list.append(y_batch.cpu().numpy())
 
     y_pred_norm = np.vstack(y_pred_list)
-
-    # 反标准化 + 偏置校正
     y_pred = y_pred_norm * scaler['y_std'] + scaler['y_mean']
     if 'bias' in scaler:
         y_pred -= scaler['bias']

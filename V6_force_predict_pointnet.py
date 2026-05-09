@@ -122,27 +122,32 @@ class ForcePointNet(nn.Module):
 # ─────────────────────── 预测器 ───────────────────────
 
 class ForcePredictor:
-    """PointNet力预测器"""
+    """PointNet力预测器，支持可选压电特征"""
 
     def __init__(self, model_dir):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # 加载配置
         with open(os.path.join(model_dir, "train_config.json"), 'r', encoding='utf-8') as f:
             self.config = json.load(f)
 
-        # 加载scaler
         sc = np.load(os.path.join(model_dir, "scaler.npz"))
         self.x_mean = sc['x_mean'].astype(np.float32)
         self.x_std = sc['x_std'].astype(np.float32)
         self.y_mean = sc['y_mean'].astype(np.float32)
         self.y_std = sc['y_std'].astype(np.float32)
 
-        # 加载模型
+        self.use_piezo = self.config.get('use_piezo', False)
+        if self.use_piezo:
+            self.p_mean = sc['p_mean'].astype(np.float32)
+            self.p_std = sc['p_std'].astype(np.float32)
+            self._p_mean_t = torch.tensor(self.p_mean, device=self.device)
+            self._p_std_t = torch.tensor(self.p_std, device=self.device)
+
         self.model = ForcePointNet(
             output_dim=self.config['output_dim'],
             use_input_transform=self.config.get('use_input_transform', True),
-            use_feature_transform=self.config.get('use_feature_transform', True)
+            use_feature_transform=self.config.get('use_feature_transform', True),
+            use_piezo=self.use_piezo,
         ).to(self.device)
 
         self.model.load_state_dict(
@@ -150,19 +155,20 @@ class ForcePredictor:
                        map_location=self.device, weights_only=True))
         self.model.eval()
 
-        # 预计算tensor版scaler
         self._x_mean_t = torch.tensor(self.x_mean, device=self.device)
         self._x_std_t = torch.tensor(self.x_std, device=self.device)
         self._y_mean_t = torch.tensor(self.y_mean, device=self.device)
         self._y_std_t = torch.tensor(self.y_std, device=self.device)
 
         self.columns = ['fx', 'fy', 'fz', 'mx', 'my', 'mz'][:self.config['output_dim']]
-        print(f"[ForcePredictor] PointNet模型已加载, 设备={self.device}, 输出={self.columns}")
+        piezo_info = "+Piezo" if self.use_piezo else ""
+        print(f"[ForcePredictor] PointNet{piezo_info}模型已加载, 设备={self.device}, 输出={self.columns}")
 
-    def predict(self, dxyz):
+    def predict(self, dxyz, piezo_feat=None):
         """单帧预测
         Args:
             dxyz: (60, 3) 或 (180,)
+            piezo_feat: (5,) 可选压电特征 [mean, std, rms, max, energy]
         Returns:
             (output_dim,)
         """
@@ -170,28 +176,48 @@ class ForcePredictor:
         x_norm = (dxyz - self.x_mean) / self.x_std
         x_t = torch.tensor(x_norm, device=self.device).unsqueeze(0)
 
+        p_t = None
+        if self.use_piezo:
+            if piezo_feat is not None:
+                p = np.asarray(piezo_feat, dtype=np.float32)
+                p_norm = (p - self.p_mean) / self.p_std
+            else:
+                p_norm = np.zeros(5, dtype=np.float32)
+            p_t = torch.tensor(p_norm, device=self.device).unsqueeze(0)
+
         with torch.no_grad():
-            y_t, _ = self.model(x_t)
+            y_t, _ = self.model(x_t, p_t)
 
         y_t = y_t * self._y_std_t + self._y_mean_t
         return y_t.cpu().numpy()[0]
 
-    def predict_batch(self, dxyz_batch):
+    def predict_batch(self, dxyz_batch, piezo_feat_batch=None):
         """批量预测
         Args:
             dxyz_batch: (T, 60, 3) 或 (T, 180)
+            piezo_feat_batch: (T, 5) 可选压电特征
         Returns:
             (T, output_dim)
         """
         dxyz_batch = np.asarray(dxyz_batch, dtype=np.float32)
         if dxyz_batch.ndim == 2:
             dxyz_batch = dxyz_batch.reshape(-1, 60, 3)
+        T = dxyz_batch.shape[0]
 
         x_norm = (dxyz_batch - self.x_mean) / self.x_std
         x_t = torch.tensor(x_norm, device=self.device)
 
+        p_t = None
+        if self.use_piezo:
+            if piezo_feat_batch is not None:
+                p = np.asarray(piezo_feat_batch, dtype=np.float32)
+                p_norm = (p - self.p_mean) / self.p_std
+            else:
+                p_norm = np.zeros((T, 5), dtype=np.float32)
+            p_t = torch.tensor(p_norm, device=self.device)
+
         with torch.no_grad():
-            y_t, _ = self.model(x_t)
+            y_t, _ = self.model(x_t, p_t)
 
         y_t = y_t * self._y_std_t + self._y_mean_t
         return y_t.cpu().numpy()

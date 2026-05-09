@@ -46,7 +46,7 @@ from scipy.spatial import Delaunay, cKDTree
 from scipy.optimize import linear_sum_assignment
 import pyqtgraph as pg
 
-from V6_force_predict_lightnet import ForcePredictor
+# ForcePredictor 根据模型类型动态导入（见 load_force_predictor）
 
 # 中文字体配置
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
@@ -1125,8 +1125,22 @@ class V7MainWindow(QMainWindow):
             print("力预测模型未加载（目录无效或未指定）")
             return
         try:
+            # 根据 train_config.json 中的 model_type 自动选择对应的 ForcePredictor
+            import json as _json
+            config_path = os.path.join(self.model_dir, "train_config.json")
+            with open(config_path, 'r', encoding='utf-8') as _f:
+                _cfg = _json.load(_f)
+            model_type = _cfg.get('model_type', 'MLP')
+
+            if model_type == 'PointNet':
+                from V6_force_predict_pointnet import ForcePredictor
+            elif model_type == 'LightNet':
+                from V6_force_predict_lightnet import ForcePredictor
+            else:
+                from V6_force_predict import ForcePredictor
+
             self.force_predictor = ForcePredictor(self.model_dir)
-            print(f"力预测模型已加载: {self.model_dir}")
+            print(f"力预测模型已加载 [{model_type}]: {self.model_dir}")
         except Exception as e:
             self.force_predictor = None
             QMessageBox.warning(self, "警告", f"力预测模型加载失败: {e}")
