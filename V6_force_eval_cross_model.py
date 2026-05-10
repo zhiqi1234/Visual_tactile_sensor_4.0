@@ -123,10 +123,20 @@ def compute_metrics(y_true, y_pred, columns):
     metrics = {}
     for i, col in enumerate(columns):
         err = y_pred[:, i] - y_true[:, i]
+        mae = float(np.mean(np.abs(err)))
+        rmse = float(np.sqrt(np.mean(err ** 2)))
+        ss_res = np.sum(err ** 2)
+        ss_tot = np.sum((y_true[:, i] - y_true[:, i].mean()) ** 2)
+        r2 = float(1 - ss_res / max(ss_tot, 1e-10))
+        max_err = float(np.max(np.abs(err)))
+        mask = np.abs(y_true[:, i]) > 0.1
+        mape = float(np.mean(np.abs(err[mask] / y_true[mask, i])) * 100) if mask.sum() > 0 else float('nan')
         metrics[col] = {
-            'MAE': float(np.mean(np.abs(err))),
-            'RMSE': float(np.sqrt(np.mean(err ** 2))),
-            'R2': float(1 - np.sum(err ** 2) / max(np.sum((y_true[:, i] - y_true[:, i].mean()) ** 2), 1e-10)),
+            'MAE': mae,
+            'RMSE': rmse,
+            'R2': r2,
+            'MaxError': max_err,
+            'MAPE(%)': mape,
         }
     return metrics
 
@@ -137,16 +147,17 @@ def print_comparison_table(all_results, columns):
     """打印完整的跨架构对比表"""
     arch_names = {'MLP': 'MLP', 'PointNet': 'PointNet', 'LightNet': 'LightNet'}
     variants = [('Vision-only', False), ('Vision+Piezo', True)]
+    metric_fields = ['MAE', 'RMSE', 'MaxError', 'MAPE(%)', 'R2']
 
     for col in columns:
-        print(f"\n{'='*90}")
+        print(f"\n{'='*110}")
         print(f"  {col}")
-        print(f"{'='*90}")
+        print(f"{'='*110}")
         header = f"{'架构':>12s} {'变体':>14s}"
-        for m in ['MAE', 'RMSE', 'R2']:
+        for m in metric_fields:
             header += f" {m:>12s}"
         print(header)
-        print("-" * 90)
+        print("-" * 110)
 
         for arch_key in ['MLP', 'PointNet', 'LightNet']:
             if arch_key not in all_results:
@@ -156,13 +167,14 @@ def print_comparison_table(all_results, columns):
                 if key not in all_results[arch_key]:
                     continue
                 m = all_results[arch_key][key][col]
-                print(f"{arch_names[arch_key]:>12s} {var_label:>14s} "
-                      f"{m['MAE']:12.4f} {m['RMSE']:12.4f} {m['R2']:12.4f}")
+                vals = " ".join(f"{m[field]:12.4f}" for field in metric_fields[:-1])
+                vals += f" {m['R2']:12.4f}"
+                print(f"{arch_names[arch_key]:>12s} {var_label:>14s} {vals}")
 
-    # 汇总：fz 的 MAE 排名
-    print(f"\n{'='*90}")
+    # 汇总排名：Fz MAE
+    print(f"\n{'='*110}")
     print(f"  Fz MAE 排名 (越低越好)")
-    print(f"{'='*90}")
+    print(f"{'='*110}")
     ranking = []
     for arch_key in ['MLP', 'PointNet', 'LightNet']:
         if arch_key not in all_results:
@@ -333,52 +345,6 @@ def plot_scatter_grid(all_results, columns, save_dir):
     print("  cross_model_scatter.png")
 
 
-def plot_improvement_heatmap(all_results, columns, save_dir):
-    """热力图：Vision+Piezo 相对 Vision-only 的改进百分比"""
-    arch_keys = ['MLP', 'PointNet', 'LightNet']
-    active_archs = [ak for ak in arch_keys if ak in all_results]
-
-    # MAE 改进百分比 (正=更好)
-    data = np.zeros((len(active_archs), len(columns)))
-    annot = np.empty((len(active_archs), len(columns)), dtype=object)
-
-    for i, arch_key in enumerate(active_archs):
-        key_vo = "Vision-only"
-        key_vp = "Vision+Piezo"
-        for j, col in enumerate(columns):
-            if key_vo in all_results[arch_key] and key_vp in all_results[arch_key]:
-                mae_vo = all_results[arch_key][key_vo][col]['MAE']
-                mae_vp = all_results[arch_key][key_vp][col]['MAE']
-                improvement = (mae_vo - mae_vp) / max(mae_vo, 1e-10) * 100
-                data[i, j] = improvement
-                annot[i, j] = f"{improvement:+.1f}%"
-            else:
-                data[i, j] = 0
-                annot[i, j] = "N/A"
-
-    fig, ax = plt.subplots(figsize=(10, 3))
-    im = ax.imshow(data, cmap='RdYlGn', aspect='auto', vmin=-15, vmax=15)
-
-    for i in range(len(active_archs)):
-        for j in range(len(columns)):
-            val = data[i, j]
-            color = 'white' if abs(val) > 8 else 'black'
-            ax.text(j, i, annot[i, j], ha='center', va='center', fontsize=11,
-                   color=color, fontweight='bold')
-
-    ax.set_xticks(range(len(columns)))
-    ax.set_xticklabels(columns, fontsize=11)
-    ax.set_yticks(range(len(active_archs)))
-    ax.set_yticklabels(active_archs, fontsize=11)
-    ax.set_title('Vision+Piezo 相对 Vision-only 的 MAE 改进 (%)', fontsize=13)
-    cbar = fig.colorbar(im, ax=ax, shrink=0.85)
-    cbar.set_label('MAE 改进 (%)', fontsize=10)
-    fig.tight_layout()
-    fig.savefig(os.path.join(save_dir, "cross_model_improvement.png"), dpi=150)
-    plt.close(fig)
-    print("  cross_model_improvement.png")
-
-
 def plot_timeseries_comparison(all_results, columns, save_dir, max_samples=800):
     """所有模型的时间序列叠加（仅 fz 分量）"""
     arch_keys = ['MLP', 'PointNet', 'LightNet']
@@ -425,6 +391,181 @@ def plot_timeseries_comparison(all_results, columns, save_dir, max_samples=800):
     fig.savefig(os.path.join(save_dir, "cross_model_timeseries.png"), dpi=150)
     plt.close(fig)
     print("  cross_model_timeseries.png")
+
+
+def plot_r2_comparison(all_results, columns, save_dir):
+    """R² 热力图对比：行=模型变体，列=力分量，颜色=越大越好"""
+    arch_keys = ['MLP', 'PointNet', 'LightNet']
+    variants = [('Vision-only', False), ('Vision+Piezo', True)]
+
+    # 收集行标签和数据
+    row_labels = []
+    data = []
+    for ak in arch_keys:
+        if ak not in all_results:
+            continue
+        for vl, _ in variants:
+            if vl not in all_results[ak]:
+                continue
+            row_labels.append(f"{ak} {vl}")
+            data.append([all_results[ak][vl][col]['R2'] for col in columns])
+
+    data = np.array(data)
+    n_rows, n_cols = data.shape
+
+    fig, ax = plt.subplots(figsize=(11, 3.5))
+    vmin = max(0, data.min() - 0.05)
+    vmax = min(1, data.max() + 0.05)
+    im = ax.imshow(data, cmap='RdYlGn', aspect='auto', vmin=vmin, vmax=vmax)
+
+    # 单元格数字标注
+    for i in range(n_rows):
+        for j in range(n_cols):
+            val = data[i, j]
+            # 参考中值决定文字颜色
+            mid = (vmin + vmax) / 2
+            color = 'white' if val > mid else 'black'
+            ax.text(j, i, f"{val:.4f}", ha='center', va='center', fontsize=10,
+                   color=color, fontweight='bold')
+
+    # 画分隔线区分架构
+    arch_boundaries = []
+    idx = 0
+    for ak in arch_keys:
+        if ak in all_results:
+            arch_boundaries.append(idx)
+            idx += 2  # 每个架构占2行(Vision-only + Vision+Piezo)
+    for b in arch_boundaries[1:]:
+        ax.axhline(y=b - 0.5, color='gray', linewidth=1.2, linestyle='--', alpha=0.6)
+
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(columns, fontsize=10)
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels(row_labels, fontsize=9)
+    ax.set_title('R$^2$ 热力图 (越大越好)', fontsize=12, fontweight='bold')
+
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85)
+    cbar.set_label('R$^2$', fontsize=10)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "cross_model_r2.png"), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print("  cross_model_r2.png")
+
+
+def plot_comprehensive_improvement(all_results, columns, save_dir):
+    """多指标改进热力图：MAE, RMSE, MAPE 的改进百分比 + R² 绝对提升"""
+    arch_keys = ['MLP', 'PointNet', 'LightNet']
+    active_archs = [ak for ak in arch_keys if ak in all_results]
+    error_metrics = ['MAE', 'RMSE', 'MAPE(%)']  # 越小越好 → 改进 = (vo-vp)/vo
+    n_archs = len(active_archs)
+    n_cols = len(columns)
+
+    # === 1. 误差指标改进百分比 (3 metrics × 6 components) ===
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for m_idx, metric in enumerate(error_metrics):
+        ax = axes[m_idx]
+        data = np.zeros((n_archs, n_cols))
+        annot = np.empty((n_archs, n_cols), dtype=object)
+        for i, arch_key in enumerate(active_archs):
+            for j, col in enumerate(columns):
+                vo = all_results[arch_key].get("Vision-only", {}).get(col, {}).get(metric, None)
+                vp = all_results[arch_key].get("Vision+Piezo", {}).get(col, {}).get(metric, None)
+                if vo is not None and vp is not None and vo > 1e-10:
+                    impr = (vo - vp) / vo * 100
+                    data[i, j] = impr
+                    annot[i, j] = f"{impr:+.1f}%"
+                else:
+                    data[i, j] = 0
+                    annot[i, j] = "N/A"
+
+        im = ax.imshow(data, cmap='RdYlGn', aspect='auto', vmin=-15, vmax=15)
+        for i in range(n_archs):
+            for j in range(n_cols):
+                val = data[i, j]
+                color = 'white' if abs(val) > 8 else 'black'
+                ax.text(j, i, annot[i, j], ha='center', va='center', fontsize=10,
+                       color=color, fontweight='bold')
+        ax.set_xticks(range(n_cols))
+        ax.set_xticklabels(columns, fontsize=10)
+        ax.set_yticks(range(n_archs))
+        ax.set_yticklabels(active_archs, fontsize=10)
+        ax.set_title(f'{metric} 改进 (正=更优)', fontsize=11, fontweight='bold')
+        fig.colorbar(im, ax=ax, shrink=0.85)
+
+    fig.suptitle('Vision+Piezo 相对 Vision-only 的改进', fontsize=14, y=1.02)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "cross_model_improvement.png"), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print("  cross_model_improvement.png (已扩展为多指标)")
+
+    # === 2. R² 绝对提升热力图 ===
+    fig, ax = plt.subplots(figsize=(10, 2.5))
+    r2_data = np.zeros((n_archs, n_cols))
+    r2_annot = np.empty((n_archs, n_cols), dtype=object)
+    for i, arch_key in enumerate(active_archs):
+        for j, col in enumerate(columns):
+            vo = all_results[arch_key].get("Vision-only", {}).get(col, {}).get('R2', None)
+            vp = all_results[arch_key].get("Vision+Piezo", {}).get(col, {}).get('R2', None)
+            if vo is not None and vp is not None:
+                delta = vp - vo
+                r2_data[i, j] = delta
+                r2_annot[i, j] = f"{delta:+.4f}"
+            else:
+                r2_data[i, j] = 0
+                r2_annot[i, j] = "N/A"
+
+    abs_max = max(abs(r2_data.min()), abs(r2_data.max()), 0.01)
+    im = ax.imshow(r2_data, cmap='RdYlGn', aspect='auto', vmin=-abs_max, vmax=abs_max)
+    for i in range(n_archs):
+        for j in range(n_cols):
+            val = r2_data[i, j]
+            color = 'white' if abs(val) > abs_max * 0.6 else 'black'
+            ax.text(j, i, r2_annot[i, j], ha='center', va='center', fontsize=10,
+                   color=color, fontweight='bold')
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(columns, fontsize=10)
+    ax.set_yticks(range(n_archs))
+    ax.set_yticklabels(active_archs, fontsize=10)
+    ax.set_title('R$^2$ 绝对提升 ($\\Delta$R$^2$, 正=更优)', fontsize=11, fontweight='bold')
+    fig.colorbar(im, ax=ax, shrink=0.85)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "cross_model_r2_improvement.png"), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print("  cross_model_r2_improvement.png")
+
+    # === 3. MaxError 改进热力图 ===
+    fig, ax = plt.subplots(figsize=(10, 2.5))
+    me_data = np.zeros((n_archs, n_cols))
+    me_annot = np.empty((n_archs, n_cols), dtype=object)
+    for i, arch_key in enumerate(active_archs):
+        for j, col in enumerate(columns):
+            vo = all_results[arch_key].get("Vision-only", {}).get(col, {}).get('MaxError', None)
+            vp = all_results[arch_key].get("Vision+Piezo", {}).get(col, {}).get('MaxError', None)
+            if vo is not None and vp is not None and vo > 1e-10:
+                impr = (vo - vp) / vo * 100
+                me_data[i, j] = impr
+                me_annot[i, j] = f"{impr:+.1f}%"
+            else:
+                me_data[i, j] = 0
+                me_annot[i, j] = "N/A"
+
+    im = ax.imshow(me_data, cmap='RdYlGn', aspect='auto', vmin=-15, vmax=15)
+    for i in range(n_archs):
+        for j in range(n_cols):
+            val = me_data[i, j]
+            color = 'white' if abs(val) > 8 else 'black'
+            ax.text(j, i, me_annot[i, j], ha='center', va='center', fontsize=10,
+                   color=color, fontweight='bold')
+    ax.set_xticks(range(n_cols))
+    ax.set_xticklabels(columns, fontsize=10)
+    ax.set_yticks(range(n_archs))
+    ax.set_yticklabels(active_archs, fontsize=10)
+    ax.set_title('MaxError 改进 (正=更优)', fontsize=11, fontweight='bold')
+    fig.colorbar(im, ax=ax, shrink=0.85)
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "cross_model_maxerr_improvement.png"), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print("  cross_model_maxerr_improvement.png")
 
 
 # ──────────────────── 主入口 ────────────────────
@@ -527,7 +668,7 @@ def main():
     # ── 打印表格 ──
     print_comparison_table(all_results, columns)
 
-    # ── 保存 JSON ──
+    # ── 保存 JSON (扩展指标) ──
     eval_dir = os.path.join(args.data_dir, "cross_model_comparison")
     os.makedirs(eval_dir, exist_ok=True)
 
@@ -536,7 +677,7 @@ def main():
         json_out[arch_key] = {}
         for variant in all_results[arch_key]:
             cols_metrics = {col: {m: all_results[arch_key][variant][col][m]
-                                  for m in ['MAE', 'RMSE', 'R2']}
+                                  for m in ['MAE', 'RMSE', 'R2', 'MaxError', 'MAPE(%)']}
                            for col in columns}
             json_out[arch_key][variant] = cols_metrics
 
@@ -549,7 +690,8 @@ def main():
     plot_mae_bar_comparison(all_results, columns, eval_dir)
     plot_radar_comparison(all_results, columns, eval_dir)
     plot_scatter_grid(all_results, columns, eval_dir)
-    plot_improvement_heatmap(all_results, columns, eval_dir)
+    plot_comprehensive_improvement(all_results, columns, eval_dir)  # 替代旧版 improvement
+    plot_r2_comparison(all_results, columns, eval_dir)              # 新增 R²
     plot_timeseries_comparison(all_results, columns, eval_dir)
 
     print(f"\n所有对比结果已保存到: {eval_dir}")
