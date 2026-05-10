@@ -88,26 +88,47 @@ class PointNetBackbone(nn.Module):
 
 
 class ForcePointNet(nn.Module):
-    def __init__(self, output_dim=6, use_input_transform=True, use_feature_transform=True):
+    """PointNet for force prediction, with optional piezo feature injection"""
+    def __init__(self, output_dim=6, use_input_transform=True, use_feature_transform=True,
+                 use_piezo=False):
         super().__init__()
         self.output_dim = output_dim
         self.use_feature_transform = use_feature_transform
+        self.use_piezo = use_piezo
+
         self.backbone = PointNetBackbone(use_input_transform, use_feature_transform)
-        self.fc1 = nn.Linear(2048, 512)
+
+        # Regression head: piezo features (5-dim) injected at global feature level
+        in_dim = 2048 + (5 if use_piezo else 0)
+        self.fc1 = nn.Linear(in_dim, 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, output_dim)
         self.bn1 = nn.BatchNorm1d(512)
         self.bn2 = nn.BatchNorm1d(256)
         self.dropout = nn.Dropout(p=0.3)
 
-    def forward(self, x):
+    def forward(self, x, piezo_feat=None):
+        """
+        Args:
+            x: (B, N, 3) or (B, 3, N) point cloud
+            piezo_feat: (B, 5) optional piezo features
+        Returns:
+            out: (B, output_dim) predicted force
+            trans_feat: feature transform matrix for regularization
+        """
         if x.dim() == 3 and x.size(2) == 3:
-            x = x.transpose(2, 1)
+            x = x.transpose(2, 1)  # (B, N, 3) -> (B, 3, N)
+
         global_feat, trans_feat = self.backbone(x)
+
+        if self.use_piezo and piezo_feat is not None:
+            global_feat = torch.cat([global_feat, piezo_feat], dim=1)
+
         x = F.relu(self.bn1(self.fc1(global_feat)))
         x = F.relu(self.bn2(self.fc2(x)))
         x = self.dropout(x)
         x = self.fc3(x)
+
         return x, trans_feat
 
     def feature_transform_regularizer(self, trans_feat):

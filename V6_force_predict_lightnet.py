@@ -11,10 +11,11 @@ import torch.nn.functional as F
 
 
 class LightNet(nn.Module):
-    """轻量级点云网络"""
-    def __init__(self, output_dim=6):
+    """轻量级点云网络：per-point Conv1d + dual pooling (max+mean)，可选压电特征注入"""
+    def __init__(self, output_dim=6, use_piezo=False):
         super().__init__()
         self.output_dim = output_dim
+        self.use_piezo = use_piezo
 
         self.conv1 = nn.Conv1d(3, 32, 1)
         self.conv2 = nn.Conv1d(32, 64, 1)
@@ -23,29 +24,42 @@ class LightNet(nn.Module):
         self.bn2 = nn.BatchNorm1d(64)
         self.bn3 = nn.BatchNorm1d(128)
 
-        self.fc1 = nn.Linear(256, 128)
+        # Regression head: piezo features (5-dim) injected at global feature level
+        in_dim = 256 + (5 if use_piezo else 0)
+        self.fc1 = nn.Linear(in_dim, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, output_dim)
         self.bn4 = nn.BatchNorm1d(128)
         self.bn5 = nn.BatchNorm1d(64)
         self.dropout = nn.Dropout(p=0.2)
 
-    def forward(self, x):
+    def forward(self, x, piezo_feat=None):
+        """
+        Args:
+            x: (B, N, 3) or (B, 3, N) point cloud
+            piezo_feat: (B, 5) optional piezo features
+        Returns:
+            out: (B, output_dim) predicted force
+        """
         if x.dim() == 3 and x.size(2) == 3:
-            x = x.transpose(2, 1)
+            x = x.transpose(2, 1)  # (B, N, 3) -> (B, 3, N)
 
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn3(self.conv3(x)))  # (B, 128, N)
 
-        max_feat = torch.max(x, 2)[0]
-        mean_feat = torch.mean(x, 2)
-        global_feat = torch.cat([max_feat, mean_feat], dim=1)
+        max_feat = torch.max(x, 2)[0]  # (B, 128)
+        mean_feat = torch.mean(x, 2)   # (B, 128)
+        global_feat = torch.cat([max_feat, mean_feat], dim=1)  # (B, 256)
+
+        if self.use_piezo and piezo_feat is not None:
+            global_feat = torch.cat([global_feat, piezo_feat], dim=1)
 
         x = F.relu(self.bn4(self.fc1(global_feat)))
         x = F.relu(self.bn5(self.fc2(x)))
         x = self.dropout(x)
         x = self.fc3(x)
+
         return x
 
 
