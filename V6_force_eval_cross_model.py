@@ -192,7 +192,7 @@ def print_comparison_table(all_results, columns):
 # ──────────────────── 图表 ────────────────────
 
 def plot_radar_comparison(all_results, columns, save_dir):
-    """雷达图：各模型在6个分量的MAE对比（越小越好）"""
+    """雷达图：各模型在6个分量的MAE对比"""
     arch_keys = ['MLP', 'PointNet', 'LightNet']
     variants = [('Vision-only', False), ('Vision+Piezo', True)]
     colors_vo = ['#3498DB', '#2ECC71', '#E67E22']
@@ -236,7 +236,7 @@ def plot_radar_comparison(all_results, columns, save_dir):
         ax.set_xticks(angles[:-1])
         ax.set_xticklabels(columns, fontsize=9)
         ax.set_ylim(0, mae_max)
-        ax.set_title(f'{title} — MAE (越小越好)', fontsize=12, pad=20)
+        ax.set_title(f'{title} — MAE', fontsize=12, pad=20)
         ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=9)
 
     fig.suptitle('MAE 雷达图', fontsize=14, y=1.02)
@@ -289,6 +289,51 @@ def plot_mae_bar_comparison(all_results, columns, save_dir):
     fig.savefig(os.path.join(save_dir, "cross_model_mae.png"), dpi=150)
     plt.close(fig)
     print("  cross_model_mae.png")
+
+
+def plot_rmse_bar_comparison(all_results, columns, save_dir):
+    """分组柱状图：所有模型在所有分量上的 RMSE"""
+    arch_keys = ['MLP', 'PointNet', 'LightNet']
+    variants = [('Vision-only', False), ('Vision+Piezo', True)]
+    n_cols = len(columns)
+    n_bars = 0
+    labels = []
+    for ak in arch_keys:
+        if ak in all_results:
+            for vl, up in variants:
+                if vl in all_results[ak]:
+                    labels.append(f"{ak}\n{vl}")
+                    n_bars += 1
+
+    x = np.arange(n_cols)
+    width = 0.8 / n_bars
+    colors = plt.cm.tab10(np.linspace(0, 1, n_bars))
+
+    fig, ax = plt.subplots(figsize=(14, 5))
+    bar_idx = 0
+    for arch_key in arch_keys:
+        if arch_key not in all_results:
+            continue
+        for var_label, use_piezo in variants:
+            key = var_label
+            if key not in all_results[arch_key]:
+                continue
+            vals = [all_results[arch_key][key][col]['RMSE'] for col in columns]
+            offset = (bar_idx - (n_bars - 1) / 2) * width
+            ax.bar(x + offset, vals, width, label=labels[bar_idx],
+                   color=colors[bar_idx], alpha=0.85, edgecolor='white', linewidth=0.5)
+            bar_idx += 1
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(columns)
+    ax.set_ylabel('RMSE')
+    ax.set_title('RMSE 对比', fontsize=13)
+    ax.legend(fontsize=8, ncol=3, loc='upper left')
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    fig.savefig(os.path.join(save_dir, "cross_model_rmse.png"), dpi=150)
+    plt.close(fig)
+    print("  cross_model_rmse.png")
 
 
 def plot_scatter_grid(all_results, columns, save_dir):
@@ -394,7 +439,7 @@ def plot_timeseries_comparison(all_results, columns, save_dir, max_samples=800):
 
 
 def plot_r2_comparison(all_results, columns, save_dir):
-    """R² 热力图对比：行=模型变体，列=力分量，颜色=越大越好"""
+    """R² 热力图对比：行=模型变体，列=力分量"""
     arch_keys = ['MLP', 'PointNet', 'LightNet']
     variants = [('Vision-only', False), ('Vision+Piezo', True)]
 
@@ -442,7 +487,7 @@ def plot_r2_comparison(all_results, columns, save_dir):
     ax.set_xticklabels(columns, fontsize=10)
     ax.set_yticks(range(n_rows))
     ax.set_yticklabels(row_labels, fontsize=9)
-    ax.set_title('R$^2$ 热力图 (越大越好)', fontsize=12, fontweight='bold')
+    ax.set_title('R$^2$ 热力图', fontsize=12, fontweight='bold')
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.85)
     cbar.set_label('R$^2$', fontsize=10)
@@ -456,7 +501,7 @@ def plot_comprehensive_improvement(all_results, columns, save_dir):
     """多指标改进热力图：MAE, RMSE, MAPE 的改进百分比 + R² 绝对提升"""
     arch_keys = ['MLP', 'PointNet', 'LightNet']
     active_archs = [ak for ak in arch_keys if ak in all_results]
-    error_metrics = ['MAE', 'RMSE', 'MAPE(%)']  # 越小越好 → 改进 = (vo-vp)/vo
+    error_metrics = ['MAE', 'RMSE', 'MAPE(%)']
     n_archs = len(active_archs)
     n_cols = len(columns)
 
@@ -688,6 +733,7 @@ def main():
     # ── 生成图表 ──
     print("\n生成图表:")
     plot_mae_bar_comparison(all_results, columns, eval_dir)
+    plot_rmse_bar_comparison(all_results, columns, eval_dir)
     plot_radar_comparison(all_results, columns, eval_dir)
     plot_scatter_grid(all_results, columns, eval_dir)
     plot_comprehensive_improvement(all_results, columns, eval_dir)  # 替代旧版 improvement

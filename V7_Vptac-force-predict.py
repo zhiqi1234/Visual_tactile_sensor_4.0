@@ -190,8 +190,9 @@ class PiezoSerialThread(QThread):
 class CameraThread(QThread):
     """摄像头采集线程"""
     frame_signal = pyqtSignal(np.ndarray, float)
+    fps_signal = pyqtSignal(float)  # 实时采集帧率
 
-    def __init__(self, camera_index=0, fps=30, rotate_180=True):
+    def __init__(self, camera_index=0, fps=60, rotate_180=True):
         super().__init__()
         self.camera_index = camera_index
         self.target_fps = fps
@@ -200,21 +201,40 @@ class CameraThread(QThread):
         self.video_cap = None
 
     def run(self):
-        self.video_cap = cv2.VideoCapture(self.camera_index)
+        self.video_cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
         if not self.video_cap.isOpened():
             return
+        self.video_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        self.video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.video_cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        actual_w = self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fourcc = int(self.video_cap.get(cv2.CAP_PROP_FOURCC))
+        print(f"[Camera] 分辨率={actual_w}x{actual_h}, FOURCC={actual_fourcc:08x}, "
+              f"目标FPS={self.target_fps}")
         frame_interval = 1.0 / self.target_fps
+
+        fps_count = 0
+        fps_last_time = time.time()
 
         while self.running:
             start_time = time.time()
             ret, frame = self.video_cap.read()
             if ret:
                 capture_timestamp = time.time()
-                # 默认不旋转，如需旋转180度请在GUI中勾选
                 if self.rotate_180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
                 self.frame_signal.emit(frame, capture_timestamp)
+
+                fps_count += 1
+                now = time.time()
+                if now - fps_last_time >= 0.5:
+                    fps = fps_count / (now - fps_last_time)
+                    self.fps_signal.emit(fps)
+                    fps_count = 0
+                    fps_last_time = now
+
             elapsed = time.time() - start_time
             wait_time = frame_interval - elapsed
             if wait_time > 0:
@@ -445,6 +465,12 @@ class V7MainWindow(QMainWindow):
             'left': {'mask': None},
             'right': {'mask': None}
         }
+
+        # PCA点云是否需要绕Z轴旋转180°（自动检测）
+        self.pca_flip_xy = False
+
+        # FPS 显示
+        self._fps_label = QLabel("FPS: --")
 
         # 检测器
         self.detector = None
@@ -721,6 +747,7 @@ class V7MainWindow(QMainWindow):
         # 状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        self.status_bar.addPermanentWidget(self._fps_label)
         self.status_bar.showMessage("就绪 - 请选择输入源")
 
         # 3D 视图鼠标事件
@@ -1277,6 +1304,7 @@ class V7MainWindow(QMainWindow):
             origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
+            self.pca_flip_xy = self._detect_pca_orientation()
 
         # 提取基准帧Delaunay拓扑边
         self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
@@ -1301,6 +1329,7 @@ class V7MainWindow(QMainWindow):
             fps=self.spin_speed.value(),
             rotate_180=self.rotate_180)
         self.camera_thread.frame_signal.connect(self.on_camera_frame)
+        self.camera_thread.fps_signal.connect(lambda fps: self._fps_label.setText(f"FPS: {fps:.1f}"))
         self.camera_thread.start()
 
         self.btn_play_pause.setEnabled(True)
@@ -1415,9 +1444,7 @@ class V7MainWindow(QMainWindow):
 
     def get_local_coords(self, points_3d):
         if self.FRAME_DATA['transform_rotation'] is not None:
-            points = self.transform_to_local_coordinates(points_3d)
-            points[:, 1] = -points[:, 1]
-            return points
+            return self.transform_to_local_coordinates(points_3d)
         return points_3d.copy()
 
     def buffer_frame_data(self, points_3d, timestamp, is_abnormal=False, predicted_force=None):
@@ -1501,6 +1528,7 @@ class V7MainWindow(QMainWindow):
                 meta.attrs['force_samples'] = len(ft_ts)
                 meta.attrs['has_force_prediction'] = self.force_predictor is not None
                 meta.attrs['ft_bias'] = self.ft_bias.tolist()  # 力传感器调零偏置
+                meta.attrs['pca_flip_xy'] = int(self.pca_flip_xy)
                 if self.model_dir:
                     meta.attrs['model_dir'] = self.model_dir
 
@@ -1956,14 +1984,27 @@ class V7MainWindow(QMainWindow):
         rotation_matrix = np.vstack([x_axis, y_axis, z_axis]).T
         return centroid, rotation_matrix
 
+    def _detect_pca_orientation(self):
+        """自动检测点云是否需要绕Z轴旋转180°。
+        规则点阵（3行）在正确取向下，最上一行Y > 6mm。
+        如果没有点满足Y > 6，说明Y轴方向反了，需要翻转XY。
+        """
+        origin = self.FRAME_DATA.get('transform_origin')
+        rotation = self.FRAME_DATA.get('transform_rotation')
+        points_3d = self.FRAME_DATA.get('base_3d_points')
+        if origin is None or rotation is None or points_3d is None:
+            return False
+        local = np.dot(points_3d - origin, rotation)
+        return np.sum(local[:, 1] > 6) == 0
+
     def transform_to_local_coordinates(self, points):
         origin = self.FRAME_DATA['transform_origin']
         rotation = self.FRAME_DATA['transform_rotation']
         translated = points - origin
         local = np.dot(translated, rotation)
-        # 绕 Z 轴旋转 180°：X、Y 取反，使点云方向与传感器视图一致
-        local[:, 0] = -local[:, 0]
-        local[:, 1] = -local[:, 1]
+        if self.pca_flip_xy:
+            local[:, 0] = -local[:, 0]
+            local[:, 1] = -local[:, 1]
         return local
 
     # ──────────────────── 显示 ────────────────────
@@ -2047,10 +2088,8 @@ class V7MainWindow(QMainWindow):
 
         if self.FRAME_DATA['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(points_3d)
-            points[:, 1] = -points[:, 1]
 
             base_local = self.transform_to_local_coordinates(self.FRAME_DATA['base_3d_points'])
-            base_local[:, 1] = -base_local[:, 1]
 
             displacement_vectors = points - base_local
             deformation = np.linalg.norm(displacement_vectors, axis=1)
@@ -2137,7 +2176,7 @@ class V7MainWindow(QMainWindow):
             self.h5_playing = not self.h5_playing
             if self.h5_playing:
                 self.btn_play_pause.setText("暂停")
-                QTimer.singleShot(33, self.h5_next_frame)
+                QTimer.singleShot(16, self.h5_next_frame)
             else:
                 self.btn_play_pause.setText("播放")
         else:
@@ -2160,7 +2199,7 @@ class V7MainWindow(QMainWindow):
         if self.h5_current_idx < n_frames - 1:
             self.h5_current_idx += 1
             self.update_h5_display()
-            QTimer.singleShot(33, self.h5_next_frame)
+            QTimer.singleShot(16, self.h5_next_frame)
         else:
             self.h5_playing = False
             self.btn_play_pause.setText("播放")
@@ -2308,6 +2347,12 @@ class V7MainWindow(QMainWindow):
             }
             self.h5_xyz_ref = self.h5_file['/reference/xyz_ref'][:]
 
+            # 读取PCA翻转标志（兼容旧文件无此属性）
+            try:
+                self.pca_flip_xy = bool(self.h5_file['/meta'].attrs.get('pca_flip_xy', False))
+            except Exception:
+                self.pca_flip_xy = False
+
             # 同步力数据
             self.sync_h5_force_to_vision()
 
@@ -2393,9 +2438,6 @@ class V7MainWindow(QMainWindow):
     def update_h5_point_cloud(self, idx):
         """更新HDF5点云显示（带力箭头）"""
         xyz = self.h5_vision_data['xyz'][idx].copy()
-        # 绕Z轴旋转180°
-        xyz[:, 0] = -xyz[:, 0]
-        xyz[:, 1] = -xyz[:, 1]
 
         predicted_force = self.h5_vision_data['predicted_force'][idx]
 

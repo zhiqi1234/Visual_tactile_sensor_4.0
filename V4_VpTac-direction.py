@@ -91,7 +91,7 @@ class CameraThread(QThread):
     """摄像头采集线程"""
     frame_signal = pyqtSignal(np.ndarray)
 
-    def __init__(self, camera_index=0, fps=30, rotate_180=True):
+    def __init__(self, camera_index=0, fps=60, rotate_180=True):
         super().__init__()
         self.camera_index = camera_index
         self.target_fps = fps

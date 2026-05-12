@@ -78,7 +78,7 @@ class ImageSaver(QThread):
 class CameraThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
     
-    def __init__(self, fps=24):
+    def __init__(self, fps=60):
         super().__init__()
         self.running = True
         self.recording = False
@@ -87,10 +87,18 @@ class CameraThread(QThread):
 
     def run(self):
         # 打开默认摄像头 (索引0)
-        self.video_cap = cv2.VideoCapture(2)
-        
+        self.video_cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+
         # 尝试设置硬件参数
+        self.video_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        self.video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.video_cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        actual_w = self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fourcc = int(self.video_cap.get(cv2.CAP_PROP_FOURCC))
+        print(f"[Camera] 分辨率={actual_w}x{actual_h}, FOURCC={actual_fourcc:08x}, "
+              f"目标FPS={self.target_fps}")
         # self.video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920) # 如需高清可解注
         # self.video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
@@ -145,7 +153,7 @@ class RecorderGUI(QMainWindow):
         self.image_saver.update_log.connect(self.log_status)
         self.image_saver.start()
 
-        self.camera_thread = CameraThread(fps=30)
+        self.camera_thread = CameraThread(fps=60)
         self.camera_thread.change_pixmap_signal.connect(self.update_image)
         self.camera_thread.start()
 

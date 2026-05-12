@@ -308,8 +308,9 @@ class PiezoSerialThread(QThread):
 class CameraThread(QThread):
     """摄像头采集线程"""
     frame_signal = pyqtSignal(np.ndarray, float)
+    fps_signal = pyqtSignal(float)  # 实时采集帧率
 
-    def __init__(self, camera_index=0, fps=30, rotate_180=True):
+    def __init__(self, camera_index=0, fps=60, rotate_180=True):
         super().__init__()
         self.camera_index = camera_index
         self.target_fps = fps
@@ -318,22 +319,40 @@ class CameraThread(QThread):
         self.video_cap = None
 
     def run(self):
-        self.video_cap = cv2.VideoCapture(self.camera_index)
+        self.video_cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
         if not self.video_cap.isOpened():
             return
 
+        self.video_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        self.video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.video_cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        actual_w = self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_h = self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fourcc = int(self.video_cap.get(cv2.CAP_PROP_FOURCC))
+        print(f"[Camera] 分辨率={actual_w}x{actual_h}, FOURCC={actual_fourcc:08x}, "
+              f"目标FPS={self.target_fps}")
         frame_interval = 1.0 / self.target_fps
+
+        fps_count = 0
+        fps_last_time = time.time()
 
         while self.running:
             start_time = time.time()
             ret, frame = self.video_cap.read()
             if ret:
                 capture_timestamp = time.time()
-                # 默认不旋转，如需旋转180度请在GUI中勾选
                 if self.rotate_180:
                     frame = cv2.rotate(frame, cv2.ROTATE_180)
                 self.frame_signal.emit(frame, capture_timestamp)
+
+                fps_count += 1
+                now = time.time()
+                if now - fps_last_time >= 0.5:
+                    fps = fps_count / (now - fps_last_time)
+                    self.fps_signal.emit(fps)
+                    fps_count = 0
+                    fps_last_time = now
 
             elapsed = time.time() - start_time
             wait_time = frame_interval - elapsed
@@ -560,6 +579,12 @@ class VideoPointCloudPlayer(QMainWindow):
             'left': {'mask': None},
             'right': {'mask': None}
         }
+
+        # PCA点云是否需要绕Z轴旋转180°（自动检测）
+        self.pca_flip_xy = False
+
+        # FPS 显示
+        self._fps_label = QLabel("FPS: --")
 
         # 检测器
         self.detector = None
@@ -828,6 +853,7 @@ class VideoPointCloudPlayer(QMainWindow):
         # 状态栏
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+        self.status_bar.addPermanentWidget(self._fps_label)
         self.status_bar.showMessage("就绪 - 请选择视频和配置文件")
 
         # 3D视图鼠标事件
@@ -1272,6 +1298,7 @@ class VideoPointCloudPlayer(QMainWindow):
             origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
+            self.pca_flip_xy = self._detect_pca_orientation()
 
         # 提取基准帧Delaunay拓扑边
         self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
@@ -1297,6 +1324,7 @@ class VideoPointCloudPlayer(QMainWindow):
             rotate_180=self.rotate_180
         )
         self.camera_thread.frame_signal.connect(self.on_camera_frame)
+        self.camera_thread.fps_signal.connect(lambda fps: self._fps_label.setText(f"FPS: {fps:.1f}"))
         self.camera_thread.start()
 
         # 启用控制按钮
@@ -1582,6 +1610,7 @@ class VideoPointCloudPlayer(QMainWindow):
             origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
             self.FRAME_DATA['transform_origin'] = origin
             self.FRAME_DATA['transform_rotation'] = rotation_matrix
+            self.pca_flip_xy = self._detect_pca_orientation()
 
         # 提取基准帧Delaunay拓扑边
         self.FRAME_DATA['left_edges'] = self.extract_edges(pts1_R.astype(np.float64))
@@ -1738,11 +1767,9 @@ class VideoPointCloudPlayer(QMainWindow):
         self.save_ft_to_hdf5(stop_time)
 
     def get_local_coords(self, points_3d):
-        """将3D点转换为可视化局部坐标（与update_3d_view一致）"""
+        """将3D点转换为局部坐标"""
         if self.FRAME_DATA['transform_rotation'] is not None:
-            points = self.transform_to_local_coordinates(points_3d)
-            points[:, 1] = -points[:, 1]
-            return points
+            return self.transform_to_local_coordinates(points_3d)
         return points_3d.copy()
 
     def buffer_frame_data(self, points_3d, timestamp, is_abnormal=False):
@@ -1822,6 +1849,7 @@ class VideoPointCloudPlayer(QMainWindow):
                 meta.attrs['marker_count'] = N
                 meta.attrs['experiment_name'] = filename
                 meta.attrs['has_piezo'] = (piezo_sample_count > 0)
+                meta.attrs['pca_flip_xy'] = int(self.pca_flip_xy)
 
                 # /force（预留扩展位置）
                 f.require_group('force')
@@ -2284,15 +2312,28 @@ class VideoPointCloudPlayer(QMainWindow):
         rotation_matrix = np.vstack([x_axis, y_axis, z_axis]).T
         return centroid, rotation_matrix
 
+    def _detect_pca_orientation(self):
+        """自动检测点云是否需要绕Z轴旋转180°。
+        规则点阵（3行）在正确取向下，最上一行Y > 6mm。
+        如果没有点满足Y > 6，说明Y轴方向反了，需要翻转XY。
+        """
+        origin = self.FRAME_DATA.get('transform_origin')
+        rotation = self.FRAME_DATA.get('transform_rotation')
+        points_3d = self.FRAME_DATA.get('base_3d_points')
+        if origin is None or rotation is None or points_3d is None:
+            return False
+        local = np.dot(points_3d - origin, rotation)
+        return np.sum(local[:, 1] > 6) == 0
+
     def transform_to_local_coordinates(self, points):
         """转换到局部坐标系"""
         origin = self.FRAME_DATA['transform_origin']
         rotation = self.FRAME_DATA['transform_rotation']
         translated = points - origin
         result = np.dot(translated, rotation)
-        # 绕 Z 轴旋转 180°：X、Y 取反，使点云方向与传感器视图一致
-        result[:, 0] = -result[:, 0]
-        result[:, 1] = -result[:, 1]
+        if self.pca_flip_xy:
+            result[:, 0] = -result[:, 0]
+            result[:, 1] = -result[:, 1]
         return result
 
     def display_frame(self, frame, left_pts=None, right_pts=None, left_lost=None, right_lost=None):
@@ -2374,10 +2415,8 @@ class VideoPointCloudPlayer(QMainWindow):
 
         if self.FRAME_DATA['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(points_3d)
-            points[:, 1] = -points[:, 1]
 
             base_local = self.transform_to_local_coordinates(self.FRAME_DATA['base_3d_points'])
-            base_local[:, 1] = -base_local[:, 1]
 
             displacement_vectors = points - base_local
             deformation = np.linalg.norm(displacement_vectors, axis=1)
