@@ -2334,6 +2334,7 @@ class VideoPointCloudPlayer(QMainWindow):
         if self.pca_flip_xy:
             result[:, 0] = -result[:, 0]
             result[:, 1] = -result[:, 1]
+        result[:, 0] = -result[:, 0]
         return result
 
     def display_frame(self, frame, left_pts=None, right_pts=None, left_lost=None, right_lost=None):

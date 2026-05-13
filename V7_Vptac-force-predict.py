@@ -2005,6 +2005,7 @@ class V7MainWindow(QMainWindow):
         if self.pca_flip_xy:
             local[:, 0] = -local[:, 0]
             local[:, 1] = -local[:, 1]
+        local[:, 0] = -local[:, 0]
         return local
 
     # ──────────────────── 显示 ────────────────────
