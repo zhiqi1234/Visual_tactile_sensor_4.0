@@ -5,7 +5,11 @@
       "Bash(python -c \"import py_compile; py_compile.compile\\(''V7_Vptac-force-predict.py'', doraise=True\\); print\\(''语法检查通过''\\)\")",
       "Bash(python -c:*)",
       "Bash(dir:*)",
-      "Bash(del \"D:\\\\JunjieWang\\\\Scientific_research\\\\Task-Visual_tactile_sensor\\\\Visual_tactile_sensor_4.0\\\\V5_h5_edit_piezo_methods.py\")"
+      "Bash(del \"D:\\\\JunjieWang\\\\Scientific_research\\\\Task-Visual_tactile_sensor\\\\Visual_tactile_sensor_4.0\\\\V5_h5_edit_piezo_methods.py\")",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
