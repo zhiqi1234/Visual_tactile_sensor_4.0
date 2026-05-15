@@ -1,8 +1,0 @@
-{
-  "calib_dir": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/calibration_1mm_12X9_0507_1_Paras",
-  "params_json_path": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/Vptac_shape_data_20260507_161628_1/marker_params.json",
-  "data_save_dir": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/Vptac_shape_data_20260507_161628_1/data",
-  "model_dir": "D:/JunjieWang/Scientific_research/Task-Visual_tactile_sensor/Visual_tactile_sensor_4.0/force_calibration/model_output_vision_piezo",
-  "camera_index": 2,
-  "rotate_180": false
-}
