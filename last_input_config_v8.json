@@ -1,0 +1,41 @@
+{
+  "project_dir": "d:\\JunjieWang\\Scientific_research\\Task-Visual_tactile_sensor\\Visual_tactile_sensor_4.0",
+  "piezo_port": "COM13",
+  "fps": 30,
+  "match_dist": 50,
+  "sensors": [
+    {
+      "calib_dir": "calibration_1mm_12X9_0519_3_Paras",
+      "params_json_path": "Vptac_shape_data_20260519_175522_3\\marker_params.json",
+      "data_save_dir": "Vptac_shape_data_20260519_175522_3\\data",
+      "model_dir": "force_calibration\\model_output_vision_piezo",
+      "camera_index": 2,
+      "rotate_180": false,
+      "piezo_adc_group": 1,
+      "piezo_channel": 3,
+      "enabled": true
+    },
+    {
+      "calib_dir": "calibration_1mm_12X9_0512_2_Paras",
+      "params_json_path": "Vptac_shape_data_20260512_153944_2\\marker_params.json",
+      "data_save_dir": "Vptac_shape_data_20260512_153944_2\\data",
+      "model_dir": "force_calibration\\model_output_vision_piezo",
+      "camera_index": 3,
+      "rotate_180": false,
+      "piezo_adc_group": 1,
+      "piezo_channel": 2,
+      "enabled": false
+    },
+    {
+      "calib_dir": null,
+      "params_json_path": null,
+      "data_save_dir": null,
+      "model_dir": null,
+      "camera_index": 2,
+      "rotate_180": true,
+      "piezo_adc_group": 2,
+      "piezo_channel": 4,
+      "enabled": false
+    }
+  ]
+}

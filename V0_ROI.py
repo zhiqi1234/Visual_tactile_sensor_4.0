@@ -183,15 +183,6 @@ def create_roi_interactive(image_path):
         print(f"错误: 无法加载图像 {image_path}")
         return False
 
-    h, w = img.shape[:2]
-    mirror_axis = w // 2
-
-    # 创建左右图像
-    left_img = np.full((h, w, 3), 255, dtype=np.uint8)
-    left_img[:, :mirror_axis] = img[:, :mirror_axis]
-    right_img = np.full((h, w, 3), 255, dtype=np.uint8)
-    right_img[:, mirror_axis:] = img[:, mirror_axis:]
-
     print("\n=== ROI区域绘制工具 ===")
     print("即将依次绘制左侧和右侧的ROI区域")
     print("操作说明：")
@@ -201,14 +192,14 @@ def create_roi_interactive(image_path):
 
     # 绘制左侧ROI
     print("步骤1: 绘制左侧ROI区域...")
-    left_mask = draw_polygon_roi(left_img.copy(), 'left')
+    left_mask = draw_polygon_roi(img.copy(), 'left')
     if left_mask is None:
         print("错误: 左侧ROI绘制失败（顶点数不足3个）")
         return False
 
     # 绘制右侧ROI
     print("\n步骤2: 绘制右侧ROI区域...")
-    right_mask = draw_polygon_roi(right_img.copy(), 'right')
+    right_mask = draw_polygon_roi(img.copy(), 'right')
     if right_mask is None:
         print("错误: 右侧ROI绘制失败（顶点数不足3个）")
         return False
