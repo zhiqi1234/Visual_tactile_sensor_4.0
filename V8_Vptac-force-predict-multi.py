@@ -170,39 +170,59 @@ class CameraThread(QThread):
     frame_signal = pyqtSignal(np.ndarray, float)
     fps_signal = pyqtSignal(float)
 
-    def __init__(self, camera_index=0, fps=30, rotate_180=True):
+    def __init__(self, camera_index=0, fps=24):
         super().__init__()
         self.camera_index = camera_index
         self.target_fps = fps
-        self.rotate_180 = rotate_180
         self.running = True
         self.video_cap = None
 
     def run(self):
-        self.video_cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
-        if not self.video_cap.isOpened():
+        # 优先 MSMF：Windows 内置 MJPEG 解码器，避免 DShow 缺 MJPEG decoder 退化为 YUY2
+        mjpeg_fourcc = cv2.VideoWriter_fourcc('M', 'J', 'P', 'G')
+        self._backend = "?"
+        for name, bid in [("MSMF", cv2.CAP_MSMF), ("DShow", cv2.CAP_DSHOW)]:
+            self.video_cap = cv2.VideoCapture(self.camera_index, bid)
+            if self.video_cap.isOpened():
+                self._backend = name
+                break
+        if not self.video_cap or not self.video_cap.isOpened():
+            print(f"[Camera {self.camera_index}] 无法打开")
             return
-        self.video_cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+
+        self.video_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.video_cap.set(cv2.CAP_PROP_FOURCC, mjpeg_fourcc)
         self.video_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.video_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.video_cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+
+        # 触发 DirectShow/MSMF 格式协商，然后验证实际的 FOURCC
+        _ = self.video_cap.read()
         actual_w = self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
         actual_h = self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
         actual_fourcc = int(self.video_cap.get(cv2.CAP_PROP_FOURCC))
-        print(f"[Camera {self.camera_index}] 分辨率={actual_w}x{actual_h}, FOURCC={actual_fourcc:08x}, "
-              f"目标FPS={self.target_fps}")
-        frame_interval = 1.0 / self.target_fps
+        fourcc_str = ''.join([chr((actual_fourcc >> i) & 0xFF) for i in range(0, 32, 8)]).rstrip('\x00')
+
+        self._mjpg_enabled = (actual_fourcc == mjpeg_fourcc)
+        if self._mjpg_enabled:
+            print(f"[Camera {self.camera_index}] {self._backend} 分辨率={actual_w}x{actual_h}, FOURCC=MJPG, "
+                  f"目标FPS={self.target_fps}")
+        else:
+            # YUY2 带宽: 640*480*2=614KB/帧，3路同时需 < ~35MB/s (USB2.0实际带宽)
+            # 安全 fps = 35MB / (3*640*480*2) ≈ 19 → 取 16 留余量
+            effective_fps = min(self.target_fps, 16)
+            self.video_cap.set(cv2.CAP_PROP_FPS, effective_fps)
+            print(f"[Camera {self.camera_index}] {self._backend} 分辨率={actual_w}x{actual_h}, "
+                  f"FOURCC={fourcc_str} (非MJPEG), USB带宽限制, "
+                  f"FPS={self.target_fps}→{effective_fps}")
 
         fps_count = 0
         fps_last_time = time.time()
 
         while self.running:
-            start_time = time.time()
             ret, frame = self.video_cap.read()
             if ret:
                 capture_timestamp = time.time()
-                if self.rotate_180:
-                    frame = cv2.rotate(frame, cv2.ROTATE_180)
                 self.frame_signal.emit(frame, capture_timestamp)
 
                 fps_count += 1
@@ -213,10 +233,7 @@ class CameraThread(QThread):
                     fps_count = 0
                     fps_last_time = now
 
-            elapsed = time.time() - start_time
-            wait_time = frame_interval - elapsed
-            if wait_time > 0:
-                time.sleep(wait_time)
+            self.msleep(1)
 
         if self.video_cap:
             self.video_cap.release()
@@ -394,7 +411,7 @@ class V8MainWindow(QMainWindow):
         self.project_dir = os.path.dirname(os.path.abspath(__file__))
 
         # 全局设置
-        self.fps = 30
+        self.fps = 24
         self.max_match_dist = 50
 
         # 当前激活的数据显示页 (0=传感器数据, 1=视频画面)
@@ -461,7 +478,6 @@ class V8MainWindow(QMainWindow):
             "data_save_dir": None,
             "model_dir": None,
             "camera_index": idx,
-            "rotate_180": idx != 0,
             "piezo_adc_group": idx,
             "piezo_channel": idx * 2,
             "enabled": False,
@@ -657,10 +673,6 @@ class V8MainWindow(QMainWindow):
         spin_cam.setValue(s['camera_index'])
         spin_cam.valueChanged.connect(lambda v, i=idx: self.sensors[i].update({'camera_index': v}))
         cam_layout.addWidget(spin_cam)
-        chk_rotate = QCheckBox("旋转180°")
-        chk_rotate.setChecked(s['rotate_180'])
-        chk_rotate.stateChanged.connect(lambda state, i=idx: self.sensors[i].update({'rotate_180': bool(state)}))
-        cam_layout.addWidget(chk_rotate)
         layout.addWidget(cam_group)
         layout.addWidget(QLabel("|"))
 
@@ -692,7 +704,7 @@ class V8MainWindow(QMainWindow):
 
         self._sensor_widgets[idx] = {
             'btn_select': btn_select, 'spin_cam': spin_cam,
-            'chk_rotate': chk_rotate, 'cbb_adc': cbb_adc,
+            'cbb_adc': cbb_adc,
             'cbb_ch': cbb_ch, 'lbl_path': lbl_path,
         }
         return w
@@ -1115,7 +1127,6 @@ class V8MainWindow(QMainWindow):
                 'data_save_dir': self._to_relative_path(s['data_save_dir']),
                 'model_dir': self._to_relative_path(s['model_dir']),
                 'camera_index': w['spin_cam'].value(),
-                'rotate_180': w['chk_rotate'].isChecked(),
                 'piezo_adc_group': w['cbb_adc'].currentIndex(),
                 'piezo_channel': w['cbb_ch'].currentIndex(),
                 'enabled': s['calib_loaded'],
@@ -1157,8 +1168,6 @@ class V8MainWindow(QMainWindow):
             w = self._sensor_widgets[i]
             if 'camera_index' in sc:
                 w['spin_cam'].setValue(sc['camera_index'])
-            if 'rotate_180' in sc:
-                w['chk_rotate'].setChecked(sc['rotate_180'])
             if 'piezo_adc_group' in sc:
                 w['cbb_adc'].setCurrentIndex(sc['piezo_adc_group'])
             if 'piezo_channel' in sc:
@@ -1166,6 +1175,8 @@ class V8MainWindow(QMainWindow):
 
             if sc.get('enabled', False) and s['calib_dir'] and os.path.exists(s['calib_dir']) \
                     and s['data_save_dir'] and os.path.exists(s['data_save_dir']):
+                if loaded_count > 0:
+                    time.sleep(0.3)  # 多摄像头错开初始化，避免DShow冲突
                 self.load_and_start(i)
                 loaded_count += 1
             else:
@@ -1217,8 +1228,8 @@ class V8MainWindow(QMainWindow):
         s['model_dir'] = model_dir if model_dir else None
 
         self._update_path_label(sensor_idx)
-        self.save_input_config()
         self.load_and_start(sensor_idx)
+        self.save_input_config()
 
     def load_and_start(self, sensor_idx):
         s = self.sensors[sensor_idx]
@@ -1379,6 +1390,7 @@ class V8MainWindow(QMainWindow):
             'frame_height': h,
         })
 
+        print(f"[S{sensor_idx+1}] 加载首帧: {os.path.basename(s['data_save_dir'])} → {len(points_3d)}点, mirror={mirror_axis}")
         if len(points_3d) >= 3:
             origin, rotation_matrix = self.build_coordinate_system_pca(points_3d)
             fd['transform_origin'] = origin
@@ -1412,7 +1424,6 @@ class V8MainWindow(QMainWindow):
         s = self.sensors[sensor_idx]
         w = self._sensor_widgets[sensor_idx]
         s['camera_index'] = w['spin_cam'].value()
-        s['rotate_180'] = w['chk_rotate'].isChecked()
 
         s['process_thread'] = FrameProcessThread()
         s['process_thread'].set_processor(
@@ -1427,8 +1438,7 @@ class V8MainWindow(QMainWindow):
 
         s['camera_thread'] = CameraThread(
             camera_index=s['camera_index'],
-            fps=self.fps,
-            rotate_180=s['rotate_180'])
+            fps=self.fps)
         s['camera_thread'].frame_signal.connect(
             lambda frame, ts, idx=sensor_idx: self.on_camera_frame(idx, frame, ts))
         s['camera_thread'].fps_signal.connect(
@@ -1449,6 +1459,10 @@ class V8MainWindow(QMainWindow):
             return
         s['latest_camera_frame'] = frame
         s['current_frame_idx'] += 1
+        if s['current_frame_idx'] == 1:
+            print(f"[S{sensor_idx+1}] camera={s['camera_index']} 首帧 OK")
+        elif s['current_frame_idx'] % 100 == 0:
+            print(f"[S{sensor_idx+1}] frame={s['current_frame_idx']}, camera_index={s['camera_index']}")
 
         h, w = frame.shape[:2]
         ref_shape = s['FRAME_DATA'].get('ref_image_shape')
@@ -1951,9 +1965,18 @@ class V8MainWindow(QMainWindow):
                 color = (0, 255, 255) if (right_lost is not None and right_lost[i]) else (0, 255, 0)
                 cv2.circle(display_img, (x, y), 4, color, -1)
 
-        rgb_image = cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB)
+        # 传感器编号水印（左上角）
+        colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]  # S1=红, S2=绿, S3=蓝
+        label = f"S{sensor_idx+1}"
+        cv2.putText(display_img, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8, colors[sensor_idx % 3], 2, cv2.LINE_AA)
+        cv2.rectangle(display_img, (3, 3), (display_img.shape[1] - 3, display_img.shape[0] - 3),
+                      colors[sensor_idx % 3], 4)
+
+        rgb_image = np.ascontiguousarray(cv2.cvtColor(display_img, cv2.COLOR_BGR2RGB))
         h, w, ch = rgb_image.shape
-        return QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        qimg = QImage(rgb_image.data, w, h, ch * w, QImage.Format_RGB888)
+        return qimg.copy()
 
     def display_frame(self, sensor_idx, frame, left_pts=None, right_pts=None,
                       left_lost=None, right_lost=None):
@@ -1963,6 +1986,11 @@ class V8MainWindow(QMainWindow):
     def _set_video_pixmap(self, sensor_idx, qt_image):
         if self.active_display_tab != 1:
             return
+        if not hasattr(self, '_vid_diag_count'):
+            self._vid_diag_count = [0, 0, 0]
+        self._vid_diag_count[sensor_idx] += 1
+        if sum(self._vid_diag_count) % 100 == 0:
+            print(f"[Video] sets: {self._vid_diag_count}")
         lbl = self.sensors[sensor_idx].get('lbl_video')
         if lbl is None:
             return

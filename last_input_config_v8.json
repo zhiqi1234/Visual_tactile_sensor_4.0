@@ -24,18 +24,18 @@
       "rotate_180": false,
       "piezo_adc_group": 1,
       "piezo_channel": 2,
-      "enabled": false
+      "enabled": true
     },
     {
-      "calib_dir": null,
-      "params_json_path": null,
-      "data_save_dir": null,
-      "model_dir": null,
-      "camera_index": 2,
-      "rotate_180": true,
+      "calib_dir": "calibration_1mm_12X9_0507_1_Paras",
+      "params_json_path": "Vptac_shape_data_20260507_161628_1\\marker_params.json",
+      "data_save_dir": "Vptac_shape_data_20260507_161628_1\\data",
+      "model_dir": "force_calibration\\model_output_vision_piezo",
+      "camera_index": 4,
+      "rotate_180": false,
       "piezo_adc_group": 2,
       "piezo_channel": 4,
-      "enabled": false
+      "enabled": true
     }
   ]
 }
