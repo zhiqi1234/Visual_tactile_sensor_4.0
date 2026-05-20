@@ -41,6 +41,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from scipy.spatial import Delaunay, cKDTree
 from scipy.optimize import linear_sum_assignment
 import pyqtgraph as pg
+import pyqtgraph.opengl as gl
 
 # ForcePredictor 根据模型类型动态导入（见 load_force_predictor）
 
@@ -512,11 +513,10 @@ class V8MainWindow(QMainWindow):
             "_pre_l_tree": None, "_pre_r_tree": None,
             "_pre_l_tree_id": None, "_pre_r_tree_id": None,
             "_stereo_rectify_cache": {},
-            "_scatter_plot": None, "_colorbar": None, "_force_arrow_plot": None,
-            "view_elev": 90, "view_azim": 0, "view_roll": -90,
-            "view_saved": False, "drag_release_time": 0,
+            # GL 3D 视图
+            "gl_view": None, "gl_scatter": None, "gl_force_arrow_lines": None,
+            "_gl_scatter_setup": False,
             "last_3d_update_time": 0, "pointcloud_frame_counter": 0,
-            "is_dragging": False, "_was_playing_before_drag": False,
             "min_3d_update_interval": 0.1, "pointcloud_update_interval": 3,
             "force_history_len": 300,
             "force_actual_history": np.zeros((300, 6)),
@@ -735,18 +735,13 @@ class V8MainWindow(QMainWindow):
             header.addWidget(btn_set_base)
             col_layout.addLayout(header)
 
-            fig_3d = plt.figure(figsize=(3.2, 2.3))
-            ax_3d = fig_3d.add_subplot(111, projection='3d')
-            canvas_3d = FigureCanvas(fig_3d)
-            canvas_3d.setMinimumHeight(180)
-            canvas_3d.mpl_connect('button_press_event', lambda event, idx=i: self.on_3d_mouse_press(idx, event))
-            canvas_3d.mpl_connect('button_release_event', lambda event, idx=i: self.on_3d_mouse_release(idx, event))
-            canvas_3d.mpl_connect('motion_notify_event', lambda event, idx=i: self.on_3d_mouse_motion(idx, event))
-            col_layout.addWidget(canvas_3d)
+            gl_view = gl.GLViewWidget()
+            gl_view.setMinimumHeight(180)
+            gl_view.setBackgroundColor((40, 40, 40))
+            gl_view.addItem(gl.GLGridItem())
+            col_layout.addWidget(gl_view)
 
-            self.sensors[i]['fig_3d'] = fig_3d
-            self.sensors[i]['ax_3d'] = ax_3d
-            self.sensors[i]['canvas_3d'] = canvas_3d
+            self.sensors[i]['gl_view'] = gl_view
             self.sensors[i]['btn_reset'] = btn_reset
             self.sensors[i]['btn_set_base'] = btn_set_base
 
@@ -1503,10 +1498,6 @@ class V8MainWindow(QMainWindow):
             return
         s['pointcloud_frame_counter'] = 0
 
-        if s['is_dragging']:
-            return
-        if time.time() - s['drag_release_time'] < 0.5:
-            return
         current_time = time.time()
         if current_time - s['last_3d_update_time'] >= s['min_3d_update_interval']:
             self.update_3d_view(sensor_idx, points_3d)
@@ -2003,82 +1994,46 @@ class V8MainWindow(QMainWindow):
         if self.active_display_tab != 0:
             return
         s = self.sensors[sensor_idx]
-        if s['is_dragging']:
-            return
-        if time.time() - s['drag_release_time'] < 0.5:
-            return
-
-        ax = s['ax_3d']
-        fig_3d = s['fig_3d']
 
         if s['FRAME_DATA']['transform_rotation'] is not None:
             points = self.transform_to_local_coordinates(sensor_idx, points_3d)
             base_local = self.transform_to_local_coordinates(sensor_idx, s['FRAME_DATA']['base_3d_points'])
             displacement_vectors = points - base_local
             deformation = np.linalg.norm(displacement_vectors, axis=1)
-
-            if s['_scatter_plot'] is None:
-                fig_3d.clear()
-                ax = fig_3d.add_subplot(111, projection='3d')
-                s['ax_3d'] = ax
-                s['_scatter_plot'] = ax.scatter(points[:, 0], points[:, 1], points[:, 2],
-                                c=deformation, cmap='jet', s=30, vmin=0, vmax=1.5)
-                s['_colorbar'] = fig_3d.colorbar(s['_scatter_plot'], ax=ax, shrink=0.8)
-                s['_colorbar'].set_label('Deformation (mm)', rotation=270, labelpad=15)
-            else:
-                s['_scatter_plot']._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
-                s['_scatter_plot'].set_array(deformation)
-
-            if s['_force_arrow_plot'] is not None:
-                try:
-                    s['_force_arrow_plot'].remove()
-                except (ValueError, AttributeError):
-                    pass
-                s['_force_arrow_plot'] = None
-
-            if s['latest_predicted_force'] is not None:
-                pred_force = s['latest_predicted_force'][:3]
-                force_mag = np.linalg.norm(pred_force)
-                if force_mag > 0.5:
-                    center = np.mean(points, axis=0)
-                    force_dir = pred_force / force_mag
-                    arrow_len = force_mag * 2.0
-                    s['_force_arrow_plot'] = ax.quiver(
-                        center[0], center[1], center[2],
-                        force_dir[0] * arrow_len, force_dir[1] * arrow_len, force_dir[2] * arrow_len,
-                        color='blue', arrow_length_ratio=0.2, linewidth=2,
-                        label=f'F={force_mag:.1f}N')
-                    ax.legend(loc='upper left', fontsize=7)
+            # 变形着色 (jet colormap, 0..1.5mm → 归一化)
+            defm_norm = np.clip(deformation / 1.5, 0.0, 1.0)
+            cmap = plt.get_cmap('jet')
+            rgba_colors = cmap(defm_norm)
+            rgba_colors[:, 3] = 0.9  # alpha
         else:
             points = points_3d.copy()
             points[:, 0] = -points[:, 0]
             points[:, 1] = -points[:, 1]
-            if s['_scatter_plot'] is None:
-                fig_3d.clear()
-                ax = fig_3d.add_subplot(111, projection='3d')
-                s['ax_3d'] = ax
-                s['_scatter_plot'] = ax.scatter(points[:, 0], points[:, 1], points[:, 2], c='b', s=30)
-            else:
-                s['_scatter_plot']._offsets3d = (points[:, 0], points[:, 1], points[:, 2])
+            rgba_colors = np.tile([0.3, 0.6, 1.0, 0.9], (len(points), 1))
 
-        ax.set_xlabel('X'); ax.set_ylabel('Y'); ax.set_zlabel('Z')
-        ax.set_title(f'S{sensor_idx+1} Frame {s["current_frame_idx"]}', fontsize=9)
-
-        if len(points) > 0:
-            ax.set_box_aspect([np.ptp(points[:, 0]), np.ptp(points[:, 1]), np.ptp(points[:, 2])])
-
-        if s['view_saved']:
-            try:
-                ax.view_init(elev=s['view_elev'], azim=s['view_azim'], roll=s['view_roll'])
-            except TypeError:
-                ax.view_init(elev=s['view_elev'], azim=s['view_azim'])
+        gl_view = s['gl_view']
+        if not s['_gl_scatter_setup']:
+            s['gl_scatter'] = gl.GLScatterPlotItem(pos=points, color=rgba_colors, size=5, pxMode=False)
+            gl_view.addItem(s['gl_scatter'])
+            s['_gl_scatter_setup'] = True
         else:
-            try:
-                ax.view_init(elev=90, azim=180, roll=-90)
-            except TypeError:
-                ax.view_init(elev=90, azim=180)
+            s['gl_scatter'].setData(pos=points, color=rgba_colors)
 
-        s['canvas_3d'].draw_idle()
+        # 力箭头
+        if s['gl_force_arrow_lines'] is not None:
+            gl_view.removeItem(s['gl_force_arrow_lines'])
+            s['gl_force_arrow_lines'] = None
+        if s['latest_predicted_force'] is not None:
+            pred_force = s['latest_predicted_force'][:3]
+            force_mag = np.linalg.norm(pred_force)
+            if force_mag > 0.5:
+                center = np.mean(points, axis=0)
+                force_dir = pred_force / force_mag
+                arrow_len = force_mag * 2.0
+                tip = center + force_dir * arrow_len
+                arrow_pts = np.array([center, tip])
+                s['gl_force_arrow_lines'] = gl.GLLinePlotItem(pos=arrow_pts, color=(0.0, 0.0, 1.0, 1.0), width=3, antialias=True)
+                gl_view.addItem(s['gl_force_arrow_lines'])
 
 
     # ──────────────────── 工具函数 ────────────────────
@@ -2256,35 +2211,6 @@ class V8MainWindow(QMainWindow):
         local[:, 0] = -local[:, 0]
         return local
 
-    # ──────────────────── 3D 视图鼠标事件 ────────────────────
-
-    def on_3d_mouse_press(self, sensor_idx, event):
-        s = self.sensors[sensor_idx]
-        s['is_dragging'] = True
-        s['_was_playing_before_drag'] = self.is_playing
-
-    def on_3d_mouse_motion(self, sensor_idx, event):
-        s = self.sensors[sensor_idx]
-        if s['is_dragging']:
-            ax = s['ax_3d']
-            s['view_elev'] = ax.elev
-            s['view_azim'] = ax.azim
-            s['view_roll'] = getattr(ax, 'roll', 0)
-            s['view_saved'] = True
-
-    def on_3d_mouse_release(self, sensor_idx, event):
-        s = self.sensors[sensor_idx]
-        if s['is_dragging']:
-            s['is_dragging'] = False
-            s['drag_release_time'] = time.time()
-            ax = s['ax_3d']
-            s['view_elev'] = ax.elev
-            s['view_azim'] = ax.azim
-            s['view_roll'] = getattr(ax, 'roll', 0)
-            s['view_saved'] = True
-            if s['_was_playing_before_drag']:
-                s['_was_playing_before_drag'] = False
-
     # ──────────────────── 播放速度 ────────────────────
 
     def update_playback_speed(self, fps_val):
@@ -2306,12 +2232,13 @@ class V8MainWindow(QMainWindow):
         fd['left_points_0_pre'] = fd['left_points_0_R'].copy()
         fd['right_points_0_pre'] = fd['right_points_0_R'].copy()
         s['consecutive_abnormal_frames'] = 0
-        s['_scatter_plot'] = None
-        s['_colorbar'] = None
-        s['_force_arrow_plot'] = None
-        s['fig_3d'].clear()
-        s['ax_3d'] = s['fig_3d'].add_subplot(111, projection='3d')
-        s['canvas_3d'].draw_idle()
+        s['_gl_scatter_setup'] = False
+        if s['gl_scatter'] is not None:
+            s['gl_view'].removeItem(s['gl_scatter'])
+            s['gl_scatter'] = None
+        if s['gl_force_arrow_lines'] is not None:
+            s['gl_view'].removeItem(s['gl_force_arrow_lines'])
+            s['gl_force_arrow_lines'] = None
         self.update_3d_view(sensor_idx, fd['base_3d_points'])
         self.status_bar.showMessage(f"Sensor {sensor_idx+1}: 已重置参考点")
 
@@ -2349,17 +2276,14 @@ class V8MainWindow(QMainWindow):
         fd['left_edges'] = self.extract_edges(left_pts.astype(np.float64))
         fd['right_edges'] = self.extract_edges(right_pts.astype(np.float64))
 
-        s['_scatter_plot'] = None
-        s['_colorbar'] = None
-        if s['_force_arrow_plot'] is not None:
-            try:
-                s['_force_arrow_plot'].remove()
-            except (ValueError, AttributeError):
-                pass
-            s['_force_arrow_plot'] = None
-        s['fig_3d'].clear()
-        s['ax_3d'] = s['fig_3d'].add_subplot(111, projection='3d')
-        s['canvas_3d'].draw_idle()
+        # 重置 GL 点云显示
+        s['_gl_scatter_setup'] = False
+        if s['gl_scatter'] is not None:
+            s['gl_view'].removeItem(s['gl_scatter'])
+            s['gl_scatter'] = None
+        if s['gl_force_arrow_lines'] is not None:
+            s['gl_view'].removeItem(s['gl_force_arrow_lines'])
+            s['gl_force_arrow_lines'] = None
 
         s['consecutive_abnormal_frames'] = 0
         s['force_actual_history'] = np.zeros((s['force_history_len'], 6))
